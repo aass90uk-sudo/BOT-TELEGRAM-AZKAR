@@ -1,8 +1,12 @@
 [phases.setup]
-nixPkgs = ["python311", "python311Packages.pip"]
+nixPkgs = ["python311"]
 
 [phases.install]
-cmds = ["pip install -r telegram_bot/requirements.txt"]
+cmds = [
+    "python3 -m venv /opt/venv",
+    "/opt/venv/bin/pip install --upgrade pip",
+    "/opt/venv/bin/pip install -r telegram_bot/requirements.txt"
+]
 
 [start]
-cmd = "cd telegram_bot && python3 main.py"
+cmd = "/opt/venv/bin/python3 telegram_bot/main.py"
