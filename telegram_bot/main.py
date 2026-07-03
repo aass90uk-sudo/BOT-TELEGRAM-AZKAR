@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from datetime import time as dt_time
+from datetime import datetime, time as dt_time
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -19,24 +19,34 @@ _raw_admins = os.environ.get("ADMIN_ID", "")
 ADMIN_IDS   = [int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdigit()]
 
 DATA_FILE = os.path.join(os.path.dirname(__file__), "users_data.json")
+TZ_RIYADH = pytz.timezone("Asia/Riyadh")
 
-# حالات المحادثة
 WAITING_PASSWORD  = 1
 WAITING_BROADCAST = 2
 
 
 # ─── قاعدة بيانات المستخدمين ──────────────────────────────────────
 
-def load_users():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f).get("users", [])
-    return []
+def load_data() -> dict:
+    """يحمّل البيانات — يدعم الصيغة القديمة (قائمة IDs) والجديدة (قائمة كائنات)."""
+    if not os.path.exists(DATA_FILE):
+        return {"users": []}
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    # ترحيل تلقائي من الصيغة القديمة
+    if data.get("users") and isinstance(data["users"][0], int):
+        data["users"] = [{"id": uid, "first_name": "—", "username": None, "joined": "—"} for uid in data["users"]]
+        save_data(data)
+    return data
 
 
-def save_users(users):
-    with open(DATA_FILE, "w") as f:
-        json.dump({"users": users}, f)
+def save_data(data: dict):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def get_user_ids() -> list:
+    return [u["id"] for u in load_data()["users"]]
 
 
 # ─── مساعدات الإدارة ──────────────────────────────────────────────
@@ -46,21 +56,18 @@ def is_admin(user_id: int) -> bool:
 
 
 def is_authenticated(context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """يتحقق إذا كان المشرف قد أدخل كلمة المرور في هذه الجلسة."""
     return context.user_data.get("admin_auth") is True
 
 
 async def show_admin_panel(target, context):
-    """يعرض لوحة التحكم — يقبل message أو callback_query."""
-    total = len(load_users())
+    total = len(load_data()["users"])
     keyboard = [
-        [InlineKeyboardButton(f"👥 المشتركون: {total} عضو", callback_data="admin_stats")],
-        [InlineKeyboardButton("📢 نشر رسالة للمشتركين",     callback_data="admin_broadcast")],
-        [InlineKeyboardButton("🔒 تسجيل الخروج",            callback_data="admin_logout")]
+        [InlineKeyboardButton(f"👥 عرض بيانات المشتركين ({total})", callback_data="admin_stats")],
+        [InlineKeyboardButton("📢 نشر رسالة للمشتركين",              callback_data="admin_broadcast")],
+        [InlineKeyboardButton("🔒 تسجيل الخروج",                     callback_data="admin_logout")]
     ]
-    text = "🛠️ لوحة تحكم المشرف\nاختر ما تريد:"
     markup = InlineKeyboardMarkup(keyboard)
-
+    text   = "🛠️ لوحة تحكم المشرف\nاختر ما تريد:"
     if hasattr(target, "reply_text"):
         await target.reply_text(text, reply_markup=markup)
     else:
@@ -70,12 +77,36 @@ async def show_admin_panel(target, context):
 # ─── /start ───────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    users = load_users()
-    if user.id not in users:
-        users.append(user.id)
-        save_users(users)
-        logger.info(f"عضو جديد: {user.id}")
+    user    = update.effective_user
+    data    = load_data()
+    user_ids = [u["id"] for u in data["users"]]
+
+    if user.id not in user_ids:
+        now = datetime.now(TZ_RIYADH).strftime("%Y-%m-%d %H:%M")
+        entry = {
+            "id":         user.id,
+            "first_name": user.first_name or "—",
+            "username":   f"@{user.username}" if user.username else None,
+            "joined":     now
+        }
+        data["users"].append(entry)
+        save_data(data)
+        logger.info(f"عضو جديد: {user.id} | {user.first_name}")
+
+        # تنبيه المشرفين بالعضو الجديد
+        notif = (
+            "🔔 مشترك جديد انضم للبوت!\n\n"
+            f"👤 الاسم: {user.first_name}\n"
+            f"🆔 المعرّف: {user.id}\n"
+            f"📛 اليوزر: {'@' + user.username if user.username else 'لا يوجد'}\n"
+            f"🕐 التاريخ: {now}\n"
+            f"👥 إجمالي المشتركين: {len(data['users'])}"
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=notif)
+            except Exception:
+                pass
 
     await update.message.reply_text(
         f"مرحباً {user.first_name} ☝🏻\n\n"
@@ -88,16 +119,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-# ─── /admin — نقطة البداية ────────────────────────────────────────
+# ─── /admin ───────────────────────────────────────────────────────
 
 async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-
-    if not is_admin(user_id):
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔️ هذا الأمر للمشرفين فقط.")
         return ConversationHandler.END
 
-    # إذا كان مصادقاً مسبقاً في هذه الجلسة
     if is_authenticated(context):
         await show_admin_panel(update.message, context)
         return WAITING_BROADCAST
@@ -111,24 +139,19 @@ async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 
 async def check_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    entered = update.message.text.strip()
-
     if not ADMIN_PASSWORD:
-        await update.message.reply_text("⚠️ لم يتم تعيين ADMIN_PASSWORD في المتغيرات البيئية.")
+        await update.message.reply_text("⚠️ لم يتم تعيين ADMIN_PASSWORD.")
         return ConversationHandler.END
 
-    if entered == ADMIN_PASSWORD:
+    if update.message.text.strip() == ADMIN_PASSWORD:
         context.user_data["admin_auth"] = True
         logger.info(f"مشرف سجّل دخولاً: {update.effective_user.id}")
         await update.message.reply_text("✅ كلمة المرور صحيحة!")
         await show_admin_panel(update.message, context)
         return WAITING_BROADCAST
-    else:
-        await update.message.reply_text(
-            "❌ كلمة المرور خاطئة.\n"
-            "أعد المحاولة أو أرسل /cancel للإلغاء."
-        )
-        return WAITING_PASSWORD
+
+    await update.message.reply_text("❌ كلمة المرور خاطئة.\nأعد المحاولة أو /cancel للإلغاء.")
+    return WAITING_PASSWORD
 
 
 # ─── أزرار لوحة التحكم ────────────────────────────────────────────
@@ -141,14 +164,41 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await query.message.reply_text("⛔️ غير مصرح. أرسل /admin وأدخل كلمة المرور.")
         return ConversationHandler.END
 
+    # ── عرض بيانات المشتركين ──
     if query.data == "admin_stats":
-        users = load_users()
+        data  = load_data()
+        users = data["users"]
+        total = len(users)
+
+        if not users:
+            await query.message.reply_text("لا يوجد مشتركون بعد.")
+            return WAITING_BROADCAST
+
+        # إرسال الإحصاء العام أولاً
         await query.message.reply_text(
-            f"📊 إحصائيات البوت:\n\n"
-            f"👥 إجمالي المشتركين: {len(users)} عضو"
+            f"📊 إحصائيات البوت\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"👥 إجمالي المشتركين: {total} عضو"
         )
+
+        # إرسال بيانات المشتركين (50 في كل رسالة لتجنب تجاوز الحد)
+        chunk_size = 50
+        for i in range(0, total, chunk_size):
+            chunk = users[i:i + chunk_size]
+            lines = []
+            for j, u in enumerate(chunk, start=i + 1):
+                uname = u.get("username") or "لا يوجد"
+                lines.append(
+                    f"{j}. {u.get('first_name','—')}\n"
+                    f"   🆔 {u['id']}\n"
+                    f"   📛 {uname}\n"
+                    f"   📅 {u.get('joined','—')}"
+                )
+            await query.message.reply_text("\n\n".join(lines))
+
         return WAITING_BROADCAST
 
+    # ── نشر رسالة ──
     elif query.data == "admin_broadcast":
         await query.message.reply_text(
             "📢 أرسل الرسالة التي تريد نشرها لجميع المشتركين:\n"
@@ -156,9 +206,10 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         return WAITING_BROADCAST
 
+    # ── تسجيل الخروج ──
     elif query.data == "admin_logout":
         context.user_data["admin_auth"] = False
-        await query.message.reply_text("🔒 تم تسجيل الخروج بنجاح.")
+        await query.message.reply_text("🔒 تم تسجيل الخروج.")
         return ConversationHandler.END
 
     return WAITING_BROADCAST
@@ -169,12 +220,12 @@ async def receive_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
 
     message_text = update.message.text
-    users = load_users()
+    user_ids     = get_user_ids()
     success, failed = 0, 0
 
-    await update.message.reply_text(f"⏳ جاري الإرسال لـ {len(users)} مشترك...")
+    await update.message.reply_text(f"⏳ جاري الإرسال لـ {len(user_ids)} مشترك...")
 
-    for uid in users:
+    for uid in user_ids:
         try:
             await context.bot.send_message(chat_id=uid, text=message_text)
             success += 1
@@ -204,7 +255,7 @@ async def send_stories_announcement(context: ContextTypes.DEFAULT_TYPE):
         "☝🏻 قصة من واقع المرابطين اليوم\n\n"
         "استعدوا واجعلوا قلوبكم حاضرة 💙"
     )
-    for uid in load_users():
+    for uid in get_user_ids():
         try:
             await context.bot.send_message(chat_id=uid, text=text)
         except Exception:
@@ -226,7 +277,7 @@ async def send_story_one(context: ContextTypes.DEFAULT_TYPE):
         "📝 الفائدة: العدل والذكاء في القضاء من أعظم صفات القاضي المسلم، "
         "وكان السلف يحرصون على أن يكون الحكم بالحق لا بالهوى أو التسرع."
     )
-    for uid in load_users():
+    for uid in get_user_ids():
         try:
             await context.bot.send_message(chat_id=uid, text=text)
         except Exception:
@@ -249,7 +300,7 @@ async def send_story_two(context: ContextTypes.DEFAULT_TYPE):
         "📝 الفائدة: الصبر الجميل في البيت عبادة عظيمة، "
         "وتربية الأبناء على الإيمان في غياب الأب جهاد حقيقي لا يقل شأناً عن غيره."
     )
-    for uid in load_users():
+    for uid in get_user_ids():
         try:
             await context.bot.send_message(chat_id=uid, text=text)
         except Exception:
@@ -265,7 +316,7 @@ async def send_night_prayer_reminder(context: ContextTypes.DEFAULT_TYPE):
         "مَنْ يَسْأَلُنِي فَأُعْطِيَهُ؟ مَنْ يَسْتَغْفِرُنِي فَأَغْفِرَ لَهُ؟» [متفق عليه]\n\n"
         "قوموا ركعتين وادعوا الله — فالدعاء في هذا الوقت مستجاب ☝🏻"
     )
-    for uid in load_users():
+    for uid in get_user_ids():
         try:
             await context.bot.send_message(chat_id=uid, text=text)
         except Exception:
@@ -279,7 +330,7 @@ async def send_white_days_reminder(context: ContextTypes.DEFAULT_TYPE):
         "قال ﷺ: «صِيَامُ ثَلاَثَةِ أَيَّامٍ مِنْ كُلِّ شَهْرٍ صِيَامُ الدَّهْرِ كُلِّهِ» [متفق عليه]\n\n"
         "فمن استطاع فليصم ولينوِ النية الليلة 🤍"
     )
-    for uid in load_users():
+    for uid in get_user_ids():
         try:
             await context.bot.send_message(chat_id=uid, text=text)
         except Exception:
@@ -295,7 +346,7 @@ def main() -> None:
     if not ADMIN_IDS:
         logger.warning("تحذير: ADMIN_ID غير محدد.")
     if not ADMIN_PASSWORD:
-        logger.warning("تحذير: ADMIN_PASSWORD غير محدد — لوحة الإدارة بدون حماية!")
+        logger.warning("تحذير: ADMIN_PASSWORD غير محدد!")
     else:
         logger.info(f"✅ المشرفون: {ADMIN_IDS} | كلمة المرور: مضبوطة")
 
@@ -320,8 +371,8 @@ def main() -> None:
     app.add_handler(admin_conv)
 
     try:
-        jq  = app.job_queue
-        tz  = pytz.timezone("Asia/Riyadh")
+        jq = app.job_queue
+        tz = TZ_RIYADH
         jq.run_daily(send_night_prayer_reminder, time=dt_time(2,  0, 0, tzinfo=tz))
         jq.run_daily(send_white_days_reminder,   time=dt_time(8,  0, 0, tzinfo=tz))
         jq.run_daily(send_stories_announcement,  time=dt_time(20, 45, 0, tzinfo=tz))
