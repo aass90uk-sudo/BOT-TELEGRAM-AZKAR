@@ -410,20 +410,15 @@ async def send_white_days_reminder(context: ContextTypes.DEFAULT_TYPE):
             continue
 
 
-# ─── التشغيل ──────────────────────────────────────────────────────
+# ─── بناء التطبيق ─────────────────────────────────────────────────
 
-def main() -> None:
-    if not BOT_TOKEN:
-        logger.error("خطأ: TELEGRAM_TOKEN غير موجود!")
-        return
-    if not ADMIN_IDS:
-        logger.warning("تحذير: ADMIN_ID غير محدد.")
-    if not ADMIN_PASSWORD:
-        logger.warning("تحذير: ADMIN_PASSWORD غير محدد!")
-    else:
-        logger.info(f"✅ المشرفون: {ADMIN_IDS} | كلمة المرور: مضبوطة")
+def build_app():
+    """ينشئ تطبيقاً جديداً في كل مرة — ضروري لإعادة المحاولة الصحيحة."""
+    token = os.environ.get("TELEGRAM_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_TOKEN غير موجود في متغيرات البيئة!")
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(token).build()
 
     admin_conv = ConversationHandler(
         entry_points=[CommandHandler("admin", admin_entry)],
@@ -443,35 +438,58 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(admin_conv)
 
-    try:
-        jq = app.job_queue
-        tz = TZ_RIYADH
-        jq.run_daily(send_night_prayer_reminder, time=dt_time(2,  0, 0, tzinfo=tz))
-        jq.run_daily(send_white_days_reminder,   time=dt_time(8,  0, 0, tzinfo=tz))
-        jq.run_daily(send_stories_announcement,  time=dt_time(20, 45, 0, tzinfo=tz))
-        jq.run_daily(send_story_one,             time=dt_time(21, 0, 0, tzinfo=tz))
-        jq.run_daily(send_story_two,             time=dt_time(21, 5, 0, tzinfo=tz))
-        logger.info("✅ تم ضبط الجدولة.")
-    except Exception as e:
-        logger.warning(f"تحذير الجدولة: {e}")
+    jq = app.job_queue
+    tz = TZ_RIYADH
+    jq.run_daily(send_night_prayer_reminder, time=dt_time(2,  0, 0, tzinfo=tz))
+    jq.run_daily(send_white_days_reminder,   time=dt_time(8,  0, 0, tzinfo=tz))
+    jq.run_daily(send_stories_announcement,  time=dt_time(20, 45, 0, tzinfo=tz))
+    jq.run_daily(send_story_one,             time=dt_time(21, 0, 0, tzinfo=tz))
+    jq.run_daily(send_story_two,             time=dt_time(21, 5, 0, tzinfo=tz))
 
-    # تشغيل health check server في خيط منفصل
+    return app
+
+
+# ─── التشغيل ──────────────────────────────────────────────────────
+
+def main() -> None:
+    # تشخيص — يُظهر المفاتيح الموجودة فقط (بدون قيم)
+    env_keys = [k for k in os.environ if k in ("TELEGRAM_TOKEN", "ADMIN_ID", "ADMIN_PASSWORD", "PORT")]
+    logger.info(f"🔑 متغيرات البيئة الموجودة: {env_keys}")
+
+    token = os.environ.get("TELEGRAM_TOKEN", "")
+    if not token:
+        logger.error("❌ TELEGRAM_TOKEN غير موجود أو فارغ — أوقف التشغيل.")
+        raise SystemExit(1)  # يُنهي العملية بكود خطأ حتى تعيد Railway التشغيل
+
+    if not ADMIN_IDS:
+        logger.warning("⚠️  ADMIN_ID غير محدد.")
+    if not ADMIN_PASSWORD:
+        logger.warning("⚠️  ADMIN_PASSWORD غير محدد.")
+    else:
+        logger.info(f"✅ المشرفون: {ADMIN_IDS}")
+
+    # تشغيل health check server في خيط منفصل (مرة واحدة فقط)
     health_thread = threading.Thread(target=start_health_server, daemon=True)
     health_thread.start()
 
-    logger.info("البوت يعمل الآن...")
+    logger.info("🚀 البوت يعمل الآن...")
 
-    # polling مع إعادة محاولة تلقائية عند الانقطاع
     retry_delay = 5
     while True:
         try:
+            logger.info("🔄 جاري بناء التطبيق وبدء الـ polling...")
+            app = build_app()          # تطبيق جديد في كل محاولة
             app.run_polling(drop_pending_updates=True)
-            break  # توقف طبيعي
+            logger.info("ℹ️  توقف polling بشكل طبيعي.")
+            break
+        except RuntimeError as e:
+            logger.error(f"❌ خطأ فادح: {e}")
+            raise SystemExit(1)        # خطأ في الإعداد — لا فائدة من إعادة المحاولة
         except Exception as e:
-            logger.error(f"⚠️ توقف البوت: {e}")
+            logger.error(f"⚠️  توقف البوت: {e}")
             logger.info(f"⏳ إعادة المحاولة خلال {retry_delay} ثانية...")
             time.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, 60)  # زيادة تدريجية حتى 60 ثانية
+            retry_delay = min(retry_delay * 2, 60)
 
 
 if __name__ == "__main__":
