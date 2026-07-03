@@ -1,7 +1,10 @@
 import os
 import json
 import logging
+import threading
+import time
 from datetime import datetime, time as dt_time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -11,6 +14,34 @@ from telegram.ext import (
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ─── Health Check Server ───────────────────────────────────────────
+
+BOT_START_TIME = datetime.utcnow()
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        uptime = (datetime.utcnow() - BOT_START_TIME).seconds
+        body   = (
+            f"status: ok\n"
+            f"uptime: {uptime}s\n"
+            f"bot: running\n"
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass  # إخفاء logs الطلبات العادية
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info(f"✅ Health check server على المنفذ {port}")
+    server.serve_forever()
+
 
 BOT_TOKEN      = os.environ.get("TELEGRAM_TOKEN")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
@@ -424,8 +455,23 @@ def main() -> None:
     except Exception as e:
         logger.warning(f"تحذير الجدولة: {e}")
 
+    # تشغيل health check server في خيط منفصل
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+
     logger.info("البوت يعمل الآن...")
-    app.run_polling()
+
+    # polling مع إعادة محاولة تلقائية عند الانقطاع
+    retry_delay = 5
+    while True:
+        try:
+            app.run_polling(drop_pending_updates=True)
+            break  # توقف طبيعي
+        except Exception as e:
+            logger.error(f"⚠️ توقف البوت: {e}")
+            logger.info(f"⏳ إعادة المحاولة خلال {retry_delay} ثانية...")
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)  # زيادة تدريجية حتى 60 ثانية
 
 
 if __name__ == "__main__":
