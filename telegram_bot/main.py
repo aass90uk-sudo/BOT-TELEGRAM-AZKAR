@@ -24,18 +24,19 @@ TZ_RIYADH = pytz.timezone("Asia/Riyadh")
 WAITING_PASSWORD  = 1
 WAITING_BROADCAST = 2
 
-
-# ─── قاعدة بيانات المستخدمين ──────────────────────────────────────
+# ─── قاعدة بيانات ─────────────────────────────────────────────────
 
 def load_data() -> dict:
-    """يحمّل البيانات — يدعم الصيغة القديمة (قائمة IDs) والجديدة (قائمة كائنات)."""
     if not os.path.exists(DATA_FILE):
         return {"users": []}
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
-    # ترحيل تلقائي من الصيغة القديمة
+    # ترحيل من الصيغة القديمة (قائمة IDs) إلى الجديدة
     if data.get("users") and isinstance(data["users"][0], int):
-        data["users"] = [{"id": uid, "first_name": "—", "username": None, "joined": "—"} for uid in data["users"]]
+        data["users"] = [
+            {"id": uid, "first_name": "—", "username": None, "joined": "—"}
+            for uid in data["users"]
+        ]
         save_data(data)
     return data
 
@@ -49,7 +50,14 @@ def get_user_ids() -> list:
     return [u["id"] for u in load_data()["users"]]
 
 
-# ─── مساعدات الإدارة ──────────────────────────────────────────────
+def find_user(user_id: int) -> dict | None:
+    for u in load_data()["users"]:
+        if u["id"] == user_id:
+            return u
+    return None
+
+
+# ─── مساعدات ──────────────────────────────────────────────────────
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -60,14 +68,14 @@ def is_authenticated(context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 async def show_admin_panel(target, context):
-    total = len(load_data()["users"])
+    total   = len(load_data()["users"])
     keyboard = [
-        [InlineKeyboardButton(f"👥 عرض بيانات المشتركين ({total})", callback_data="admin_stats")],
-        [InlineKeyboardButton("📢 نشر رسالة للمشتركين",              callback_data="admin_broadcast")],
-        [InlineKeyboardButton("🔒 تسجيل الخروج",                     callback_data="admin_logout")]
+        [InlineKeyboardButton(f"👥 قائمة المشتركين ({total})", callback_data="admin_stats")],
+        [InlineKeyboardButton("📢 نشر رسالة للمشتركين",         callback_data="admin_broadcast")],
+        [InlineKeyboardButton("🔒 تسجيل الخروج",                callback_data="admin_logout")]
     ]
-    markup = InlineKeyboardMarkup(keyboard)
     text   = "🛠️ لوحة تحكم المشرف\nاختر ما تريد:"
+    markup = InlineKeyboardMarkup(keyboard)
     if hasattr(target, "reply_text"):
         await target.reply_text(text, reply_markup=markup)
     else:
@@ -77,34 +85,36 @@ async def show_admin_panel(target, context):
 # ─── /start ───────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user    = update.effective_user
-    data    = load_data()
-    user_ids = [u["id"] for u in data["users"]]
+    user = update.effective_user
+    data = load_data()
+    ids  = [u["id"] for u in data["users"]]
 
-    if user.id not in user_ids:
-        now = datetime.now(TZ_RIYADH).strftime("%Y-%m-%d %H:%M")
+    if user.id not in ids:
+        now   = datetime.now(TZ_RIYADH).strftime("%Y-%m-%d %H:%M")
         entry = {
             "id":         user.id,
             "first_name": user.first_name or "—",
-            "username":   f"@{user.username}" if user.username else None,
-            "joined":     now
+            "last_name":  user.last_name  or "",
+            "username":   user.username   or None,
+            "joined":     now,
         }
         data["users"].append(entry)
         save_data(data)
         logger.info(f"عضو جديد: {user.id} | {user.first_name}")
 
-        # تنبيه المشرفين بالعضو الجديد
+        # إشعار المشرفين
+        uname = f"@{user.username}" if user.username else "لا يوجد"
         notif = (
             "🔔 مشترك جديد انضم للبوت!\n\n"
-            f"👤 الاسم: {user.first_name}\n"
+            f"👤 الاسم: {user.first_name} {user.last_name or ''}\n"
             f"🆔 المعرّف: {user.id}\n"
-            f"📛 اليوزر: {'@' + user.username if user.username else 'لا يوجد'}\n"
+            f"📛 اليوزر: {uname}\n"
             f"🕐 التاريخ: {now}\n"
             f"👥 إجمالي المشتركين: {len(data['users'])}"
         )
-        for admin_id in ADMIN_IDS:
+        for aid in ADMIN_IDS:
             try:
-                await context.bot.send_message(chat_id=admin_id, text=notif)
+                await context.bot.send_message(chat_id=aid, text=notif)
             except Exception:
                 pass
 
@@ -132,7 +142,7 @@ async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     await update.message.reply_text(
         "🔐 لوحة تحكم المشرف\n\n"
-        "أدخل كلمة المرور السرية للمتابعة:\n"
+        "أدخل كلمة المرور السرية:\n"
         "(أرسل /cancel للإلغاء)"
     )
     return WAITING_PASSWORD
@@ -164,42 +174,74 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await query.message.reply_text("⛔️ غير مصرح. أرسل /admin وأدخل كلمة المرور.")
         return ConversationHandler.END
 
-    # ── عرض بيانات المشتركين ──
-    if query.data == "admin_stats":
-        data  = load_data()
-        users = data["users"]
-        total = len(users)
+    data = query.data
 
+    # ── قائمة المشتركين ──
+    if data == "admin_stats":
+        users = load_data()["users"]
         if not users:
             await query.message.reply_text("لا يوجد مشتركون بعد.")
             return WAITING_BROADCAST
 
-        # إرسال الإحصاء العام أولاً
         await query.message.reply_text(
-            f"📊 إحصائيات البوت\n"
-            f"━━━━━━━━━━━━━━━━\n"
-            f"👥 إجمالي المشتركين: {total} عضو"
+            f"📊 إجمالي المشتركين: {len(users)} عضو\n"
+            "اضغط على أي اسم لرؤية تفاصيله:"
         )
 
-        # إرسال بيانات المشتركين (50 في كل رسالة لتجنب تجاوز الحد)
-        chunk_size = 50
-        for i in range(0, total, chunk_size):
+        # إرسال قائمة بأزرار (10 في كل رسالة)
+        chunk_size = 10
+        for i in range(0, len(users), chunk_size):
             chunk = users[i:i + chunk_size]
-            lines = []
-            for j, u in enumerate(chunk, start=i + 1):
-                uname = u.get("username") or "لا يوجد"
-                lines.append(
-                    f"{j}. {u.get('first_name','—')}\n"
-                    f"   🆔 {u['id']}\n"
-                    f"   📛 {uname}\n"
-                    f"   📅 {u.get('joined','—')}"
-                )
-            await query.message.reply_text("\n\n".join(lines))
+            keyboard = []
+            for u in chunk:
+                name  = u.get("first_name", "—")
+                lname = u.get("last_name", "")
+                label = f"👤 {name} {lname}".strip() + f"  |  🆔 {u['id']}"
+                keyboard.append([InlineKeyboardButton(label, callback_data=f"user_{u['id']}")])
+            await query.message.reply_text(
+                f"المشتركون {i+1} — {min(i+chunk_size, len(users))}:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        return WAITING_BROADCAST
 
+    # ── تفاصيل مشترك واحد ──
+    if data.startswith("user_"):
+        uid  = int(data.split("_")[1])
+        user = find_user(uid)
+        if not user:
+            await query.message.reply_text("لم يتم العثور على المشترك.")
+            return WAITING_BROADCAST
+
+        uname    = f"@{user['username']}" if user.get("username") else "لا يوجد"
+        lname    = user.get("last_name", "")
+        fullname = f"{user.get('first_name','—')} {lname}".strip()
+
+        # رابط فتح حسابه مباشرة في تليجرام
+        if user.get("username"):
+            profile_link = f"https://t.me/{user['username']}"
+            link_btn     = InlineKeyboardButton("🔗 فتح الحساب", url=profile_link)
+        else:
+            profile_link = f"tg://user?id={uid}"
+            link_btn     = InlineKeyboardButton("🔗 فتح الحساب", url=profile_link)
+
+        keyboard = [
+            [link_btn],
+            [InlineKeyboardButton("◀️ رجوع للقائمة", callback_data="admin_stats")]
+        ]
+
+        await query.message.reply_text(
+            f"👤 بيانات المشترك\n"
+            f"━━━━━━━━━━━━━━━━\n\n"
+            f"📝 الاسم الكامل: {fullname}\n"
+            f"🆔 المعرّف (ID): {uid}\n"
+            f"📛 اليوزر: {uname}\n"
+            f"📅 تاريخ الانضمام: {user.get('joined','—')}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return WAITING_BROADCAST
 
     # ── نشر رسالة ──
-    elif query.data == "admin_broadcast":
+    if data == "admin_broadcast":
         await query.message.reply_text(
             "📢 أرسل الرسالة التي تريد نشرها لجميع المشتركين:\n"
             "(أرسل /cancel للإلغاء)"
@@ -207,7 +249,7 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return WAITING_BROADCAST
 
     # ── تسجيل الخروج ──
-    elif query.data == "admin_logout":
+    if data == "admin_logout":
         context.user_data["admin_auth"] = False
         await query.message.reply_text("🔒 تم تسجيل الخروج.")
         return ConversationHandler.END
@@ -219,8 +261,8 @@ async def receive_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not is_admin(update.effective_user.id) or not is_authenticated(context):
         return ConversationHandler.END
 
-    message_text = update.message.text
-    user_ids     = get_user_ids()
+    message_text   = update.message.text
+    user_ids       = get_user_ids()
     success, failed = 0, 0
 
     await update.message.reply_text(f"⏳ جاري الإرسال لـ {len(user_ids)} مشترك...")
@@ -359,7 +401,7 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, check_password)
             ],
             WAITING_BROADCAST: [
-                CallbackQueryHandler(admin_button, pattern="^admin_"),
+                CallbackQueryHandler(admin_button, pattern="^(admin_|user_)"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_broadcast)
             ],
         },
