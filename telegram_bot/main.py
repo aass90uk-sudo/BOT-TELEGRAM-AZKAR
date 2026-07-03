@@ -13,7 +13,10 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+
+# يدعم مشرفاً واحداً أو عدة مشرفين مفصولين بفاصلة: 123,456,789
+_raw_admins = os.environ.get("ADMIN_ID", "")
+ADMIN_IDS = [int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdigit()]
 
 DATA_FILE = os.path.join(os.path.dirname(__file__), "users_data.json")
 
@@ -33,7 +36,7 @@ def save_users(users):
 
 
 def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
+    return user_id in ADMIN_IDS
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -227,8 +230,10 @@ def main() -> None:
         logger.error("خطأ: TELEGRAM_TOKEN غير موجود!")
         return
 
-    if ADMIN_ID == 0:
+    if not ADMIN_IDS:
         logger.warning("تحذير: ADMIN_ID غير محدد — لوحة الإدارة لن تعمل.")
+    else:
+        logger.info(f"✅ المشرفون: {ADMIN_IDS}")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
