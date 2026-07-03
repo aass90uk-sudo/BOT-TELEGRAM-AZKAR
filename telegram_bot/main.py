@@ -12,16 +12,20 @@ from telegram.ext import (
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+BOT_TOKEN      = os.environ.get("TELEGRAM_TOKEN")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 
-# يدعم مشرفاً واحداً أو عدة مشرفين مفصولين بفاصلة: 123,456,789
 _raw_admins = os.environ.get("ADMIN_ID", "")
-ADMIN_IDS = [int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdigit()]
+ADMIN_IDS   = [int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdigit()]
 
 DATA_FILE = os.path.join(os.path.dirname(__file__), "users_data.json")
 
-WAITING_BROADCAST = 1
+# حالات المحادثة
+WAITING_PASSWORD  = 1
+WAITING_BROADCAST = 2
 
+
+# ─── قاعدة بيانات المستخدمين ──────────────────────────────────────
 
 def load_users():
     if os.path.exists(DATA_FILE):
@@ -35,19 +39,43 @@ def save_users(users):
         json.dump({"users": users}, f)
 
 
+# ─── مساعدات الإدارة ──────────────────────────────────────────────
+
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+def is_authenticated(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """يتحقق إذا كان المشرف قد أدخل كلمة المرور في هذه الجلسة."""
+    return context.user_data.get("admin_auth") is True
+
+
+async def show_admin_panel(target, context):
+    """يعرض لوحة التحكم — يقبل message أو callback_query."""
+    total = len(load_users())
+    keyboard = [
+        [InlineKeyboardButton(f"👥 المشتركون: {total} عضو", callback_data="admin_stats")],
+        [InlineKeyboardButton("📢 نشر رسالة للمشتركين",     callback_data="admin_broadcast")],
+        [InlineKeyboardButton("🔒 تسجيل الخروج",            callback_data="admin_logout")]
+    ]
+    text = "🛠️ لوحة تحكم المشرف\nاختر ما تريد:"
+    markup = InlineKeyboardMarkup(keyboard)
+
+    if hasattr(target, "reply_text"):
+        await target.reply_text(text, reply_markup=markup)
+    else:
+        await target.message.reply_text(text, reply_markup=markup)
+
+
+# ─── /start ───────────────────────────────────────────────────────
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    user_id = user.id
-
     users = load_users()
-    if user_id not in users:
-        users.append(user_id)
+    if user.id not in users:
+        users.append(user.id)
         save_users(users)
-        logger.info(f"عضو جديد: {user_id}")
+        logger.info(f"عضو جديد: {user.id}")
 
     await update.message.reply_text(
         f"مرحباً {user.first_name} ☝🏻\n\n"
@@ -60,28 +88,57 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔️ هذا الأمر للمشرف فقط.")
-        return
+# ─── /admin — نقطة البداية ────────────────────────────────────────
 
-    total = len(load_users())
-    keyboard = [
-        [InlineKeyboardButton(f"👥 المشتركون: {total} عضو", callback_data="admin_stats")],
-        [InlineKeyboardButton("📢 نشر رسالة للمشتركين", callback_data="admin_broadcast")]
-    ]
+async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔️ هذا الأمر للمشرفين فقط.")
+        return ConversationHandler.END
+
+    # إذا كان مصادقاً مسبقاً في هذه الجلسة
+    if is_authenticated(context):
+        await show_admin_panel(update.message, context)
+        return WAITING_BROADCAST
+
     await update.message.reply_text(
-        "🛠️ لوحة تحكم المشرف",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "🔐 لوحة تحكم المشرف\n\n"
+        "أدخل كلمة المرور السرية للمتابعة:\n"
+        "(أرسل /cancel للإلغاء)"
     )
+    return WAITING_PASSWORD
 
+
+async def check_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    entered = update.message.text.strip()
+
+    if not ADMIN_PASSWORD:
+        await update.message.reply_text("⚠️ لم يتم تعيين ADMIN_PASSWORD في المتغيرات البيئية.")
+        return ConversationHandler.END
+
+    if entered == ADMIN_PASSWORD:
+        context.user_data["admin_auth"] = True
+        logger.info(f"مشرف سجّل دخولاً: {update.effective_user.id}")
+        await update.message.reply_text("✅ كلمة المرور صحيحة!")
+        await show_admin_panel(update.message, context)
+        return WAITING_BROADCAST
+    else:
+        await update.message.reply_text(
+            "❌ كلمة المرور خاطئة.\n"
+            "أعد المحاولة أو أرسل /cancel للإلغاء."
+        )
+        return WAITING_PASSWORD
+
+
+# ─── أزرار لوحة التحكم ────────────────────────────────────────────
 
 async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
 
-    if not is_admin(query.from_user.id):
-        await query.message.reply_text("⛔️ غير مصرح.")
+    if not is_admin(query.from_user.id) or not is_authenticated(context):
+        await query.message.reply_text("⛔️ غير مصرح. أرسل /admin وأدخل كلمة المرور.")
         return ConversationHandler.END
 
     if query.data == "admin_stats":
@@ -90,7 +147,7 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             f"📊 إحصائيات البوت:\n\n"
             f"👥 إجمالي المشتركين: {len(users)} عضو"
         )
-        return ConversationHandler.END
+        return WAITING_BROADCAST
 
     elif query.data == "admin_broadcast":
         await query.message.reply_text(
@@ -99,17 +156,21 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         return WAITING_BROADCAST
 
-    return ConversationHandler.END
+    elif query.data == "admin_logout":
+        context.user_data["admin_auth"] = False
+        await query.message.reply_text("🔒 تم تسجيل الخروج بنجاح.")
+        return ConversationHandler.END
+
+    return WAITING_BROADCAST
 
 
 async def receive_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id) or not is_authenticated(context):
         return ConversationHandler.END
 
     message_text = update.message.text
     users = load_users()
-    success = 0
-    failed = 0
+    success, failed = 0, 0
 
     await update.message.reply_text(f"⏳ جاري الإرسال لـ {len(users)} مشترك...")
 
@@ -133,7 +194,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# ─── المهام المجدولة ───────────────────────────────────────────────
+# ─── المهام المجدولة ──────────────────────────────────────────────
 
 async def send_stories_announcement(context: ContextTypes.DEFAULT_TYPE):
     text = (
@@ -225,43 +286,48 @@ async def send_white_days_reminder(context: ContextTypes.DEFAULT_TYPE):
             continue
 
 
+# ─── التشغيل ──────────────────────────────────────────────────────
+
 def main() -> None:
     if not BOT_TOKEN:
         logger.error("خطأ: TELEGRAM_TOKEN غير موجود!")
         return
-
     if not ADMIN_IDS:
-        logger.warning("تحذير: ADMIN_ID غير محدد — لوحة الإدارة لن تعمل.")
+        logger.warning("تحذير: ADMIN_ID غير محدد.")
+    if not ADMIN_PASSWORD:
+        logger.warning("تحذير: ADMIN_PASSWORD غير محدد — لوحة الإدارة بدون حماية!")
     else:
-        logger.info(f"✅ المشرفون: {ADMIN_IDS}")
+        logger.info(f"✅ المشرفون: {ADMIN_IDS} | كلمة المرور: مضبوطة")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    broadcast_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_button, pattern="^admin_")],
+    admin_conv = ConversationHandler(
+        entry_points=[CommandHandler("admin", admin_entry)],
         states={
+            WAITING_PASSWORD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, check_password)
+            ],
             WAITING_BROADCAST: [
+                CallbackQueryHandler(admin_button, pattern="^admin_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_broadcast)
-            ]
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_user=True,
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(broadcast_conv)
+    app.add_handler(admin_conv)
 
     try:
-        jq = app.job_queue
-        tz = pytz.timezone("Asia/Riyadh")
-
-        jq.run_daily(send_night_prayer_reminder,   time=dt_time(2, 0, 0, tzinfo=tz))
-        jq.run_daily(send_white_days_reminder,     time=dt_time(8, 0, 0, tzinfo=tz))
-        jq.run_daily(send_stories_announcement,    time=dt_time(20, 45, 0, tzinfo=tz))
-        jq.run_daily(send_story_one,               time=dt_time(21, 0, 0, tzinfo=tz))
-        jq.run_daily(send_story_two,               time=dt_time(21, 5, 0, tzinfo=tz))
-
-        logger.info("✅ تم ضبط نظام الجدولة بنجاح.")
+        jq  = app.job_queue
+        tz  = pytz.timezone("Asia/Riyadh")
+        jq.run_daily(send_night_prayer_reminder, time=dt_time(2,  0, 0, tzinfo=tz))
+        jq.run_daily(send_white_days_reminder,   time=dt_time(8,  0, 0, tzinfo=tz))
+        jq.run_daily(send_stories_announcement,  time=dt_time(20, 45, 0, tzinfo=tz))
+        jq.run_daily(send_story_one,             time=dt_time(21, 0, 0, tzinfo=tz))
+        jq.run_daily(send_story_two,             time=dt_time(21, 5, 0, tzinfo=tz))
+        logger.info("✅ تم ضبط الجدولة.")
     except Exception as e:
         logger.warning(f"تحذير الجدولة: {e}")
 
