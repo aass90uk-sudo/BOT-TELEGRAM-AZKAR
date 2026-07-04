@@ -228,6 +228,21 @@ def count_banned() -> int:
         return conn.execute("SELECT COUNT(*) FROM banned").fetchone()[0]
 
 
+def register_admins():
+    """تسجيل المشرفين تلقائياً كمشتركين عند بدء البوت إن لم يكونوا مسجلين."""
+    if not ADMIN_IDS:
+        return
+    now = datetime.now(TZ_RIYADH).strftime("%Y-%m-%d %H:%M")
+    with get_db() as conn:
+        for aid in ADMIN_IDS:
+            conn.execute(
+                "INSERT OR IGNORE INTO users (id, first_name, joined) VALUES (?,?,?)",
+                (aid, "مشرف", now),
+            )
+        conn.commit()
+    logger.info(f"✅ تم تسجيل المشرفين كمشتركين: {ADMIN_IDS}")
+
+
 # ─── مساعدات ──────────────────────────────────────────────────────
 
 def is_admin(user_id: int) -> bool:
@@ -992,6 +1007,8 @@ def main() -> None:
 
     # تهيئة قاعدة البيانات (وترحيل JSON إن وجد)
     init_db()
+    # تسجيل المشرفين تلقائياً كمشتركين حتى تصلهم الرسائل
+    register_admins()
     logger.info(f"✅ قاعدة البيانات جاهزة — {count_users()} مشترك مسجّل")
 
     health_thread = threading.Thread(target=start_health_server, daemon=True)
