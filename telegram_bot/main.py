@@ -414,9 +414,16 @@ async def send_white_days_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 def build_app():
     """ينشئ تطبيقاً جديداً في كل مرة — ضروري لإعادة المحاولة الصحيحة."""
-    token = os.environ.get("TELEGRAM_TOKEN")
+    token = (
+        os.environ.get("TELEGRAM_TOKEN") or
+        os.environ.get("BOT_TOKEN")       or
+        os.environ.get("TOKEN")
+    )
     if not token:
-        raise RuntimeError("TELEGRAM_TOKEN غير موجود في متغيرات البيئة!")
+        raise RuntimeError(
+            "لم يُعثر على توكن البوت! "
+            "أضف أحد هذه المتغيرات: TELEGRAM_TOKEN أو BOT_TOKEN أو TOKEN"
+        )
 
     app = ApplicationBuilder().token(token).build()
 
@@ -453,13 +460,21 @@ def build_app():
 
 def main() -> None:
     # تشخيص — يُظهر المفاتيح الموجودة فقط (بدون قيم)
-    env_keys = [k for k in os.environ if k in ("TELEGRAM_TOKEN", "ADMIN_ID", "ADMIN_PASSWORD", "PORT")]
+    watched = ("TELEGRAM_TOKEN", "BOT_TOKEN", "TOKEN", "ADMIN_ID", "ADMIN_PASSWORD", "PORT")
+    env_keys = [k for k in os.environ if k in watched]
     logger.info(f"🔑 متغيرات البيئة الموجودة: {env_keys}")
 
-    token = os.environ.get("TELEGRAM_TOKEN", "")
+    token = (
+        os.environ.get("TELEGRAM_TOKEN") or
+        os.environ.get("BOT_TOKEN")       or
+        os.environ.get("TOKEN")
+    )
     if not token:
-        logger.error("❌ TELEGRAM_TOKEN غير موجود أو فارغ — أوقف التشغيل.")
-        raise SystemExit(1)  # يُنهي العملية بكود خطأ حتى تعيد Railway التشغيل
+        logger.error(
+            "❌ لم يُعثر على توكن البوت! "
+            "أضف أحد هذه المتغيرات في Railway: TELEGRAM_TOKEN أو BOT_TOKEN أو TOKEN"
+        )
+        raise SystemExit(1)
 
     if not ADMIN_IDS:
         logger.warning("⚠️  ADMIN_ID غير محدد.")
