@@ -2,5 +2,5 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "/opt/venv/bin/python3 telegram_bot/main.py"
 restartPolicyType = "always"
+restartPolicyMaxRetries = 10
