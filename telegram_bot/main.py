@@ -1,3 +1,4 @@
+import io
 import os
 import json
 import logging
@@ -55,6 +56,7 @@ TZ_RIYADH = pytz.timezone("Asia/Riyadh")
 
 WAITING_PASSWORD  = 1
 WAITING_BROADCAST = 2
+WAITING_IMPORT    = 3
 
 # ─── قاعدة بيانات ─────────────────────────────────────────────────
 
@@ -110,10 +112,15 @@ def is_authenticated(context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 async def show_admin_panel(target, context):
-    total   = len(load_data()["users"])
+    data    = load_data()
+    total   = len(data["users"])
+    banned  = len(data.get("banned", []))
     keyboard = [
         [InlineKeyboardButton(f"👥 قائمة المشتركين ({total})", callback_data="admin_stats")],
         [InlineKeyboardButton("📢 نشر رسالة للمشتركين",         callback_data="admin_broadcast")],
+        [InlineKeyboardButton(f"🚫 المحظورون ({banned})",        callback_data="admin_banned")],
+        [InlineKeyboardButton("📦 نسخة احتياطية للمشتركين",     callback_data="admin_backup")],
+        [InlineKeyboardButton("📥 استيراد مشتركين (JSON)",      callback_data="admin_import")],
         [InlineKeyboardButton("🔒 تسجيل الخروج",                callback_data="admin_logout")]
     ]
     text   = "🛠️ لوحة تحكم المشرف\nاختر ما تريد:"
@@ -321,6 +328,57 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await query.message.reply_text(f"✅ تم إلغاء حظر {name} ({uid}).\nسيتلقى الرسائل مجدداً.")
         return WAITING_BROADCAST
 
+    # ── قائمة المحظورين ──
+    if data == "admin_banned":
+        db      = load_data()
+        banned  = db.get("banned", [])
+        if not banned:
+            await query.message.reply_text("✅ لا يوجد أي مشترك محظور حالياً.")
+            return WAITING_BROADCAST
+        keyboard = []
+        for uid in banned:
+            user = find_user(uid)
+            name = f"{user.get('first_name','—')}" if user else "—"
+            keyboard.append([InlineKeyboardButton(
+                f"🔴 {name}  |  🆔 {uid}",
+                callback_data=f"user_{uid}"
+            )])
+        keyboard.append([InlineKeyboardButton("◀️ رجوع", callback_data="admin_stats")])
+        await query.message.reply_text(
+            f"🚫 المحظورون ({len(banned)}):",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return WAITING_BROADCAST
+
+    # ── نسخة احتياطية ──
+    if data == "admin_backup":
+        db       = load_data()
+        raw      = json.dumps(db, ensure_ascii=False, indent=2).encode("utf-8")
+        bio      = io.BytesIO(raw)
+        bio.name = "users_data.json"
+        total    = len(db["users"])
+        banned   = len(db.get("banned", []))
+        await query.message.reply_document(
+            document=bio,
+            filename="users_data.json",
+            caption=(
+                f"📦 نسخة احتياطية\n"
+                f"👥 المشتركون: {total}\n"
+                f"🚫 المحظورون: {banned}\n"
+                f"📅 {datetime.now(TZ_RIYADH).strftime('%Y-%m-%d %H:%M')}"
+            )
+        )
+        return WAITING_BROADCAST
+
+    # ── استيراد مشتركين ──
+    if data == "admin_import":
+        await query.message.reply_text(
+            "📥 أرسل ملف JSON الخاص بالمشتركين لاستيراده.\n"
+            "يجب أن يكون بنفس صيغة ملف النسخ الاحتياطي.\n\n"
+            "(أرسل /cancel للإلغاء)"
+        )
+        return WAITING_IMPORT
+
     # ── نشر رسالة ──
     if data == "admin_broadcast":
         await query.message.reply_text(
@@ -359,6 +417,56 @@ async def receive_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"✅ تم الإرسال!\n\n"
         f"✔️ نجح: {success}\n"
         f"❌ فشل: {failed}"
+    )
+    return ConversationHandler.END
+
+
+async def receive_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id) or not is_authenticated(context):
+        return ConversationHandler.END
+
+    doc = update.message.document
+    if not doc or not doc.file_name.endswith(".json"):
+        await update.message.reply_text("❌ يرجى إرسال ملف JSON فقط.")
+        return WAITING_IMPORT
+
+    try:
+        tg_file = await doc.get_file()
+        raw     = await tg_file.download_as_bytearray()
+        imported = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        await update.message.reply_text(f"❌ فشل قراءة الملف: {e}")
+        return WAITING_IMPORT
+
+    if "users" not in imported:
+        await update.message.reply_text("❌ الملف لا يحتوي على مفتاح 'users'. تأكد أنه ملف نسخ احتياطي صحيح.")
+        return WAITING_IMPORT
+
+    current     = load_data()
+    existing_ids = {u["id"] for u in current["users"]}
+    added       = 0
+
+    for user in imported.get("users", []):
+        if isinstance(user, int):
+            # صيغة قديمة — تحويل
+            user = {"id": user, "first_name": "—", "username": None, "joined": "—"}
+        if user.get("id") not in existing_ids:
+            current["users"].append(user)
+            existing_ids.add(user["id"])
+            added += 1
+
+    # دمج قائمة الحظر
+    imported_banned = imported.get("banned", [])
+    for uid in imported_banned:
+        if uid not in current["banned"]:
+            current["banned"].append(uid)
+
+    save_data(current)
+    await update.message.reply_text(
+        f"✅ تم الاستيراد بنجاح!\n\n"
+        f"➕ مشتركون جدد مضافون: {added}\n"
+        f"🚫 محظورون مستوردون: {len(imported_banned)}\n"
+        f"👥 إجمالي المشتركين الآن: {len(current['users'])}"
     )
     return ConversationHandler.END
 
@@ -622,6 +730,10 @@ def build_app():
             WAITING_BROADCAST: [
                 CallbackQueryHandler(admin_button, pattern="^(admin_|user_|ban_|unban_)"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_broadcast)
+            ],
+            WAITING_IMPORT: [
+                MessageHandler(filters.Document.ALL, receive_import),
+                CallbackQueryHandler(admin_button, pattern="^(admin_|user_|ban_|unban_)"),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
