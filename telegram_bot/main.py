@@ -9,7 +9,10 @@ from datetime import datetime, time as dt_time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytz
 from hijri_converter import Gregorian
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton
+)
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes,
     CallbackQueryHandler, ConversationHandler, MessageHandler, filters
@@ -54,9 +57,10 @@ ADMIN_IDS   = [int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdig
 
 TZ_RIYADH = pytz.timezone("Asia/Riyadh")
 
-WAITING_PASSWORD  = 1
-WAITING_BROADCAST = 2
-WAITING_IMPORT    = 3
+WAITING_BROADCAST = 1
+WAITING_IMPORT    = 2
+
+ADMIN_PANEL_BTN = "🛠️ لوحة التحكم"
 
 # ─── قاعدة بيانات SQLite ──────────────────────────────────────────
 
@@ -249,9 +253,6 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-def is_authenticated(context: ContextTypes.DEFAULT_TYPE) -> bool:
-    return context.user_data.get("admin_auth") is True
-
 
 async def show_admin_panel(target, context):
     total  = count_users()
@@ -263,7 +264,6 @@ async def show_admin_panel(target, context):
         [InlineKeyboardButton(f"🚫 المحظورون ({banned})",     callback_data="admin_banned")],
         [InlineKeyboardButton("📦 نسخة احتياطية (JSON)",      callback_data="admin_backup")],
         [InlineKeyboardButton("📥 استيراد مشتركين (JSON)",   callback_data="admin_import")],
-        [InlineKeyboardButton("🔒 تسجيل الخروج",             callback_data="admin_logout")],
     ]
     text   = (
         "🛠️ *لوحة تحكم المشرف*\n\n"
@@ -316,6 +316,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 pass
 
+    # لوحة مفاتيح دائمة للمشرف
+    if is_admin(user.id):
+        reply_markup = ReplyKeyboardMarkup(
+            [[KeyboardButton(ADMIN_PANEL_BTN)]],
+            resize_keyboard=True,
+            is_persistent=True,
+        )
+    else:
+        reply_markup = None
+
     await update.message.reply_text(
         f"السلام عليكم ورحمة الله وبركاته 🌿\n"
         f"أهلاً وسهلاً بك يا {user.first_name} في البوت الإسلامي الدعوي.\n\n"
@@ -325,44 +335,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🌌 تنبيه قيام الليل — الساعة 2:00 فجراً\n\n"
         "📚 قصتان إسلاميتان من السلف — الساعة 9:00 مساءً\n\n"
         "📅 تذكير صيام الأيام البيض — أيام 13 و14 و15 من كل شهر هجري\n\n"
-        "نسأل الله أن ينفع بهذا البوت وأن يجعله في ميزان حسناتكم ☝🏻"
+        "نسأل الله أن ينفع بهذا البوت وأن يجعله في ميزان حسناتكم ☝🏻",
+        reply_markup=reply_markup,
     )
 
 
-# ─── /admin ───────────────────────────────────────────────────────
+# ─── /admin والزر الدائم ──────────────────────────────────────────
 
 async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔️ هذا الأمر للمشرفين فقط.")
         return ConversationHandler.END
 
-    if is_authenticated(context):
-        await show_admin_panel(update.message, context)
-        return WAITING_BROADCAST
-
-    await update.message.reply_text(
-        "🔐 *لوحة تحكم المشرف*\n\n"
-        "أدخل كلمة المرور السرية:\n"
-        "_(أرسل /cancel للإلغاء)_",
-        parse_mode="Markdown",
-    )
-    return WAITING_PASSWORD
-
-
-async def check_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not ADMIN_PASSWORD:
-        await update.message.reply_text("⚠️ لم يتم تعيين ADMIN_PASSWORD.")
-        return ConversationHandler.END
-
-    if update.message.text.strip() == ADMIN_PASSWORD:
-        context.user_data["admin_auth"] = True
-        logger.info(f"مشرف سجّل دخولاً: {update.effective_user.id}")
-        await update.message.reply_text("✅ كلمة المرور صحيحة!")
-        await show_admin_panel(update.message, context)
-        return WAITING_BROADCAST
-
-    await update.message.reply_text("❌ كلمة المرور خاطئة.\nأعد المحاولة أو /cancel للإلغاء.")
-    return WAITING_PASSWORD
+    logger.info(f"مشرف فتح لوحة التحكم: {update.effective_user.id}")
+    await show_admin_panel(update.message, context)
+    return WAITING_BROADCAST
 
 
 # ─── أزرار لوحة التحكم ────────────────────────────────────────────
@@ -371,8 +358,8 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     query = update.callback_query
     await query.answer()
 
-    if not is_admin(query.from_user.id) or not is_authenticated(context):
-        await query.message.reply_text("⛔️ غير مصرح. أرسل /admin وأدخل كلمة المرور.")
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text("⛔️ غير مصرح.")
         return ConversationHandler.END
 
     data = query.data
@@ -582,17 +569,11 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         return WAITING_BROADCAST
 
-    # ── تسجيل الخروج ──
-    if data == "admin_logout":
-        context.user_data["admin_auth"] = False
-        await query.message.reply_text("🔒 تم تسجيل الخروج.")
-        return ConversationHandler.END
-
     return WAITING_BROADCAST
 
 
 async def receive_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not is_admin(update.effective_user.id) or not is_authenticated(context):
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
 
     message_text    = update.message.text
@@ -619,7 +600,7 @@ async def receive_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def receive_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not is_admin(update.effective_user.id) or not is_authenticated(context):
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
 
     doc = update.message.document
@@ -945,21 +926,27 @@ def build_app():
     app = ApplicationBuilder().token(token).build()
 
     admin_conv = ConversationHandler(
-        entry_points=[CommandHandler("admin", admin_entry)],
+        entry_points=[
+            CommandHandler("admin", admin_entry),
+            MessageHandler(filters.Regex(f"^{ADMIN_PANEL_BTN}$"), admin_entry),
+        ],
         states={
-            WAITING_PASSWORD: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, check_password)
-            ],
             WAITING_BROADCAST: [
                 CallbackQueryHandler(admin_button, pattern="^(admin_|user_|ban_|unban_|delete_)"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_broadcast),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{ADMIN_PANEL_BTN}$"),
+                    receive_broadcast,
+                ),
             ],
             WAITING_IMPORT: [
                 MessageHandler(filters.Document.ALL, receive_import),
                 CallbackQueryHandler(admin_button, pattern="^(admin_|user_|ban_|unban_|delete_)"),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex(f"^{ADMIN_PANEL_BTN}$"), admin_entry),
+        ],
         per_user=True,
     )
 
