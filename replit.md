@@ -17,7 +17,7 @@ cd telegram_bot && python3 main.py
 
 | Key | Description |
 |-----|-------------|
-| `TELEGRAM_TOKEN` | Bot token from @BotFather (required) |
+| `TELEGRAM_TOKEN` | Bot token from @BotFather (required — also accepted as `BOT_TOKEN` or `TOKEN`) |
 | `ADMIN_ID` | Comma-separated Telegram user IDs for admin access (optional) |
 | `ADMIN_PASSWORD` | Password for the in-bot admin panel (optional) |
 
