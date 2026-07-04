@@ -1,6 +1,7 @@
 import io
 import os
 import json
+import sqlite3
 import logging
 import threading
 import time
@@ -35,7 +36,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, format, *args):
-        pass  # إخفاء logs الطلبات العادية
+        pass
 
 
 def start_health_server():
@@ -51,54 +52,180 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 _raw_admins = os.environ.get("ADMIN_ID", "")
 ADMIN_IDS   = [int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdigit()]
 
-DATA_FILE = os.path.join(os.path.dirname(__file__), "users_data.json")
 TZ_RIYADH = pytz.timezone("Asia/Riyadh")
 
 WAITING_PASSWORD  = 1
 WAITING_BROADCAST = 2
 WAITING_IMPORT    = 3
 
-# ─── قاعدة بيانات ─────────────────────────────────────────────────
+# ─── قاعدة بيانات SQLite ──────────────────────────────────────────
+
+# مسار قابل للتهيئة عبر DATA_DIR (مفيد لـ Railway Volumes)
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR  = os.environ.get("DATA_DIR", _BASE_DIR)
+DB_FILE   = os.path.join(DATA_DIR, "bot.db")
+
+
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    """إنشاء الجداول وترحيل البيانات القديمة من JSON إن وجدت."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id         INTEGER PRIMARY KEY,
+                first_name TEXT    DEFAULT '—',
+                last_name  TEXT    DEFAULT '',
+                username   TEXT,
+                joined     TEXT    DEFAULT '—'
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS banned (
+                user_id INTEGER PRIMARY KEY
+            )
+        """)
+        conn.commit()
+    _migrate_json()
+
+
+def _migrate_json():
+    """ترحيل تلقائي من users_data.json القديم إلى SQLite."""
+    json_file = os.path.join(_BASE_DIR, "users_data.json")
+    if not os.path.exists(json_file):
+        return
+    try:
+        with open(json_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        with get_db() as conn:
+            for u in data.get("users", []):
+                if isinstance(u, int):
+                    u = {"id": u, "first_name": "—", "username": None, "joined": "—"}
+                conn.execute(
+                    "INSERT OR IGNORE INTO users (id, first_name, last_name, username, joined) "
+                    "VALUES (?,?,?,?,?)",
+                    (
+                        u.get("id"),
+                        u.get("first_name", "—"),
+                        u.get("last_name", ""),
+                        u.get("username"),
+                        u.get("joined", "—"),
+                    ),
+                )
+            for uid in data.get("banned", []):
+                conn.execute("INSERT OR IGNORE INTO banned (user_id) VALUES (?)", (uid,))
+            conn.commit()
+        os.rename(json_file, json_file + ".migrated")
+        logger.info("✅ تم ترحيل البيانات من JSON إلى SQLite بنجاح")
+    except Exception as e:
+        logger.error(f"⚠️ خطأ في ترحيل JSON: {e}")
+
+
+# ─── دوال قاعدة البيانات ──────────────────────────────────────────
 
 def load_data() -> dict:
-    if not os.path.exists(DATA_FILE):
-        return {"users": [], "banned": []}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    # ترحيل من الصيغة القديمة (قائمة IDs) إلى الجديدة
-    if data.get("users") and isinstance(data["users"][0], int):
-        data["users"] = [
-            {"id": uid, "first_name": "—", "username": None, "joined": "—"}
-            for uid in data["users"]
-        ]
-        save_data(data)
-    # إضافة قائمة الحظر إن لم تكن موجودة
-    if "banned" not in data:
-        data["banned"] = []
-        save_data(data)
-    return data
+    """تحميل كامل البيانات كـ dict — للنسخ الاحتياطية والاستيراد."""
+    with get_db() as conn:
+        users  = [dict(r) for r in conn.execute(
+            "SELECT id, first_name, last_name, username, joined FROM users"
+        ).fetchall()]
+        banned = [r[0] for r in conn.execute("SELECT user_id FROM banned").fetchall()]
+    return {"users": users, "banned": banned}
 
 
 def save_data(data: dict):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    """استبدال كامل لجميع البيانات — يُستخدم عند الاستيراد فقط."""
+    with get_db() as conn:
+        conn.execute("DELETE FROM users")
+        conn.execute("DELETE FROM banned")
+        for u in data.get("users", []):
+            conn.execute(
+                "INSERT INTO users (id, first_name, last_name, username, joined) VALUES (?,?,?,?,?)",
+                (
+                    u.get("id"),
+                    u.get("first_name", "—"),
+                    u.get("last_name", ""),
+                    u.get("username"),
+                    u.get("joined", "—"),
+                ),
+            )
+        for uid in data.get("banned", []):
+            conn.execute("INSERT OR IGNORE INTO banned (user_id) VALUES (?)", (uid,))
+        conn.commit()
+
+
+def add_user(entry: dict):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO users (id, first_name, last_name, username, joined) "
+            "VALUES (?,?,?,?,?)",
+            (
+                entry["id"],
+                entry.get("first_name", "—"),
+                entry.get("last_name", ""),
+                entry.get("username"),
+                entry.get("joined", "—"),
+            ),
+        )
+        conn.commit()
+
+
+def user_exists(user_id: int) -> bool:
+    with get_db() as conn:
+        return conn.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() is not None
 
 
 def get_user_ids() -> list:
-    data = load_data()
-    banned = set(data.get("banned", []))
-    return [u["id"] for u in data["users"] if u["id"] not in banned]
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id FROM users WHERE id NOT IN (SELECT user_id FROM banned)"
+        ).fetchall()
+    return [r[0] for r in rows]
 
 
 def is_banned(user_id: int) -> bool:
-    return user_id in load_data().get("banned", [])
+    with get_db() as conn:
+        return conn.execute("SELECT 1 FROM banned WHERE user_id=?", (user_id,)).fetchone() is not None
 
 
 def find_user(user_id: int) -> dict | None:
-    for u in load_data()["users"]:
-        if u["id"] == user_id:
-            return u
-    return None
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def ban_user(user_id: int):
+    with get_db() as conn:
+        conn.execute("INSERT OR IGNORE INTO banned (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+
+
+def unban_user(user_id: int):
+    with get_db() as conn:
+        conn.execute("DELETE FROM banned WHERE user_id=?", (user_id,))
+        conn.commit()
+
+
+def delete_user(user_id: int):
+    with get_db() as conn:
+        conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+        conn.execute("DELETE FROM banned WHERE user_id=?", (user_id,))
+        conn.commit()
+
+
+def count_users() -> int:
+    with get_db() as conn:
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+
+def count_banned() -> int:
+    with get_db() as conn:
+        return conn.execute("SELECT COUNT(*) FROM banned").fetchone()[0]
 
 
 # ─── مساعدات ──────────────────────────────────────────────────────
@@ -112,23 +239,29 @@ def is_authenticated(context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 async def show_admin_panel(target, context):
-    data    = load_data()
-    total   = len(data["users"])
-    banned  = len(data.get("banned", []))
+    total  = count_users()
+    banned = count_banned()
+    active = total - banned
     keyboard = [
-        [InlineKeyboardButton(f"👥 قائمة المشتركين ({total})", callback_data="admin_stats")],
-        [InlineKeyboardButton("📢 نشر رسالة للمشتركين",         callback_data="admin_broadcast")],
-        [InlineKeyboardButton(f"🚫 المحظورون ({banned})",        callback_data="admin_banned")],
-        [InlineKeyboardButton("📦 نسخة احتياطية للمشتركين",     callback_data="admin_backup")],
-        [InlineKeyboardButton("📥 استيراد مشتركين (JSON)",      callback_data="admin_import")],
-        [InlineKeyboardButton("🔒 تسجيل الخروج",                callback_data="admin_logout")]
+        [InlineKeyboardButton(f"👥 المشتركون ({active} نشط / {total} إجمالي)", callback_data="admin_stats")],
+        [InlineKeyboardButton("📢 نشر رسالة للمشتركين",      callback_data="admin_broadcast")],
+        [InlineKeyboardButton(f"🚫 المحظورون ({banned})",     callback_data="admin_banned")],
+        [InlineKeyboardButton("📦 نسخة احتياطية (JSON)",      callback_data="admin_backup")],
+        [InlineKeyboardButton("📥 استيراد مشتركين (JSON)",   callback_data="admin_import")],
+        [InlineKeyboardButton("🔒 تسجيل الخروج",             callback_data="admin_logout")],
     ]
-    text   = "🛠️ لوحة تحكم المشرف\nاختر ما تريد:"
+    text   = (
+        "🛠️ *لوحة تحكم المشرف*\n\n"
+        f"👥 إجمالي المشتركين: *{total}*\n"
+        f"🟢 النشطون: *{active}*\n"
+        f"🔴 المحظورون: *{banned}*\n\n"
+        "اختر ما تريد:"
+    )
     markup = InlineKeyboardMarkup(keyboard)
     if hasattr(target, "reply_text"):
-        await target.reply_text(text, reply_markup=markup)
+        await target.reply_text(text, reply_markup=markup, parse_mode="Markdown")
     else:
-        await target.message.reply_text(text, reply_markup=markup)
+        await target.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
 
 
 # ─── /start ───────────────────────────────────────────────────────
@@ -140,10 +273,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("عذراً، لا يمكنك استخدام هذا البوت.")
         return
 
-    data = load_data()
-    ids  = [u["id"] for u in data["users"]]
-
-    if user.id not in ids:
+    if not user_exists(user.id):
         now   = datetime.now(TZ_RIYADH).strftime("%Y-%m-%d %H:%M")
         entry = {
             "id":         user.id,
@@ -152,11 +282,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "username":   user.username   or None,
             "joined":     now,
         }
-        data["users"].append(entry)
-        save_data(data)
+        add_user(entry)
+        total = count_users()
         logger.info(f"عضو جديد: {user.id} | {user.first_name}")
 
-        # إشعار المشرفين
         uname = f"@{user.username}" if user.username else "لا يوجد"
         notif = (
             "🔔 مشترك جديد انضم للبوت!\n\n"
@@ -164,7 +293,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"🆔 المعرّف: {user.id}\n"
             f"📛 اليوزر: {uname}\n"
             f"🕐 التاريخ: {now}\n"
-            f"👥 إجمالي المشتركين: {len(data['users'])}"
+            f"👥 إجمالي المشتركين: {total}"
         )
         for aid in ADMIN_IDS:
             try:
@@ -197,9 +326,10 @@ async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return WAITING_BROADCAST
 
     await update.message.reply_text(
-        "🔐 لوحة تحكم المشرف\n\n"
+        "🔐 *لوحة تحكم المشرف*\n\n"
         "أدخل كلمة المرور السرية:\n"
-        "(أرسل /cancel للإلغاء)"
+        "_(أرسل /cancel للإلغاء)_",
+        parse_mode="Markdown",
     )
     return WAITING_PASSWORD
 
@@ -232,6 +362,11 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     data = query.data
 
+    # ── رجوع للوحة الرئيسية ──
+    if data == "admin_home":
+        await show_admin_panel(query, context)
+        return WAITING_BROADCAST
+
     # ── قائمة المشتركين ──
     if data == "admin_stats":
         users = load_data()["users"]
@@ -240,11 +375,11 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             return WAITING_BROADCAST
 
         await query.message.reply_text(
-            f"📊 إجمالي المشتركين: {len(users)} عضو\n"
-            "اضغط على أي اسم لرؤية تفاصيله:"
+            f"📊 *إجمالي المشتركين: {len(users)} عضو*\n"
+            "اضغط على أي اسم لرؤية تفاصيله:",
+            parse_mode="Markdown",
         )
 
-        # إرسال قائمة بأزرار (10 في كل رسالة)
         chunk_size = 10
         for i in range(0, len(users), chunk_size):
             chunk = users[i:i + chunk_size]
@@ -252,17 +387,22 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             for u in chunk:
                 name  = u.get("first_name", "—")
                 lname = u.get("last_name", "")
-                label = f"👤 {name} {lname}".strip() + f"  |  🆔 {u['id']}"
+                banned_mark = "🔴 " if is_banned(u["id"]) else "🟢 "
+                label = f"{banned_mark}{name} {lname}".strip() + f"  |  {u['id']}"
                 keyboard.append([InlineKeyboardButton(label, callback_data=f"user_{u['id']}")])
             await query.message.reply_text(
                 f"المشتركون {i+1} — {min(i+chunk_size, len(users))}:",
-                reply_markup=InlineKeyboardMarkup(keyboard)
+                reply_markup=InlineKeyboardMarkup(keyboard),
             )
         return WAITING_BROADCAST
 
     # ── تفاصيل مشترك واحد ──
     if data.startswith("user_"):
-        uid  = int(data.split("_")[1])
+        try:
+            uid = int(data.split("_")[1])
+        except (IndexError, ValueError):
+            await query.message.reply_text("❌ معرّف غير صالح.")
+            return WAITING_BROADCAST
         user = find_user(uid)
         if not user:
             await query.message.reply_text("لم يتم العثور على المشترك.")
@@ -272,8 +412,8 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         lname    = user.get("last_name", "")
         fullname = f"{user.get('first_name','—')} {lname}".strip()
         banned   = is_banned(uid)
+        status   = "🔴 محظور" if banned else "🟢 نشط"
 
-        # رابط فتح حسابه مباشرة في تليجرام
         if user.get("username"):
             link_btn = InlineKeyboardButton("🔗 فتح الحساب", url=f"https://t.me/{user['username']}")
         else:
@@ -288,65 +428,102 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         keyboard = [
             [link_btn],
             [ban_btn],
-            [InlineKeyboardButton("◀️ رجوع للقائمة", callback_data="admin_stats")]
+            [InlineKeyboardButton("🗑️ حذف من القاعدة", callback_data=f"delete_{uid}")],
+            [InlineKeyboardButton("◀️ رجوع للقائمة",   callback_data="admin_stats")],
         ]
 
-        status = "🔴 محظور" if banned else "🟢 نشط"
         await query.message.reply_text(
-            f"👤 بيانات المشترك\n"
+            f"👤 *بيانات المشترك*\n"
             f"━━━━━━━━━━━━━━━━\n\n"
             f"📝 الاسم الكامل: {fullname}\n"
-            f"🆔 المعرّف (ID): {uid}\n"
+            f"🆔 المعرّف (ID): `{uid}`\n"
             f"📛 اليوزر: {uname}\n"
             f"📅 تاريخ الانضمام: {user.get('joined','—')}\n"
             f"📌 الحالة: {status}",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown",
         )
         return WAITING_BROADCAST
 
     # ── حظر مشترك ──
     if data.startswith("ban_"):
-        uid  = int(data.split("_")[1])
-        db   = load_data()
-        if uid not in db["banned"]:
-            db["banned"].append(uid)
-            save_data(db)
+        try:
+            uid = int(data.split("_")[1])
+        except (IndexError, ValueError):
+            await query.message.reply_text("❌ معرّف غير صالح.")
+            return WAITING_BROADCAST
+        ban_user(uid)
         user = find_user(uid)
         name = user.get("first_name", str(uid)) if user else str(uid)
-        await query.message.reply_text(f"🚫 تم حظر {name} ({uid}) بنجاح.\nلن يتلقى أي رسائل بعد الآن.")
+        await query.message.reply_text(
+            f"🚫 تم حظر *{name}* (`{uid}`) بنجاح.\n"
+            "لن يتلقى أي رسائل بعد الآن.",
+            parse_mode="Markdown",
+        )
         return WAITING_BROADCAST
 
     # ── إلغاء حظر مشترك ──
     if data.startswith("unban_"):
-        uid  = int(data.split("_")[1])
-        db   = load_data()
-        if uid in db["banned"]:
-            db["banned"].remove(uid)
-            save_data(db)
+        try:
+            uid = int(data.split("_")[1])
+        except (IndexError, ValueError):
+            await query.message.reply_text("❌ معرّف غير صالح.")
+            return WAITING_BROADCAST
+        unban_user(uid)
         user = find_user(uid)
         name = user.get("first_name", str(uid)) if user else str(uid)
-        await query.message.reply_text(f"✅ تم إلغاء حظر {name} ({uid}).\nسيتلقى الرسائل مجدداً.")
+        await query.message.reply_text(
+            f"✅ تم إلغاء حظر *{name}* (`{uid}`).\n"
+            "سيتلقى الرسائل مجدداً.",
+            parse_mode="Markdown",
+        )
+        return WAITING_BROADCAST
+
+    # ── حذف مشترك نهائياً ──
+    if data.startswith("delete_"):
+        try:
+            uid = int(data.split("_")[1])
+        except (IndexError, ValueError):
+            await query.message.reply_text("❌ معرّف غير صالح.")
+            return WAITING_BROADCAST
+        user = find_user(uid)
+        name = user.get("first_name", str(uid)) if user else str(uid)
+        delete_user(uid)
+        await query.message.reply_text(
+            f"🗑️ تم حذف *{name}* (`{uid}`) من قاعدة البيانات نهائياً.",
+            parse_mode="Markdown",
+        )
         return WAITING_BROADCAST
 
     # ── قائمة المحظورين ──
     if data == "admin_banned":
-        db      = load_data()
-        banned  = db.get("banned", [])
-        if not banned:
+        with get_db() as conn:
+            banned_ids = [r[0] for r in conn.execute("SELECT user_id FROM banned").fetchall()]
+        if not banned_ids:
             await query.message.reply_text("✅ لا يوجد أي مشترك محظور حالياً.")
             return WAITING_BROADCAST
         keyboard = []
-        for uid in banned:
+        for uid in banned_ids:
             user = find_user(uid)
-            name = f"{user.get('first_name','—')}" if user else "—"
-            keyboard.append([InlineKeyboardButton(
-                f"🔴 {name}  |  🆔 {uid}",
-                callback_data=f"user_{uid}"
-            )])
-        keyboard.append([InlineKeyboardButton("◀️ رجوع", callback_data="admin_stats")])
+            if user:
+                # مشترك موجود في قاعدة البيانات — فتح صفحته
+                name = user.get("first_name", "—")
+                keyboard.append([InlineKeyboardButton(
+                    f"🔴 {name}  |  {uid}",
+                    callback_data=f"user_{uid}",
+                )])
+            else:
+                # مشترك محظور غير موجود في جدول users — أزرار مباشرة
+                keyboard.append([
+                    InlineKeyboardButton(f"🔴 {uid}", callback_data=f"user_{uid}"),
+                    InlineKeyboardButton("✅ رفع الحظر", callback_data=f"unban_{uid}"),
+                    InlineKeyboardButton("🗑️ حذف",      callback_data=f"delete_{uid}"),
+                ])
+        keyboard.append([InlineKeyboardButton("◀️ رجوع", callback_data="admin_home")])
         await query.message.reply_text(
-            f"🚫 المحظورون ({len(banned)}):",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            f"🚫 *المحظورون ({len(banned_ids)}):*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown",
         )
         return WAITING_BROADCAST
 
@@ -362,11 +539,12 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             document=bio,
             filename="users_data.json",
             caption=(
-                f"📦 نسخة احتياطية\n"
+                f"📦 *نسخة احتياطية*\n"
                 f"👥 المشتركون: {total}\n"
                 f"🚫 المحظورون: {banned}\n"
                 f"📅 {datetime.now(TZ_RIYADH).strftime('%Y-%m-%d %H:%M')}"
-            )
+            ),
+            parse_mode="Markdown",
         )
         return WAITING_BROADCAST
 
@@ -375,15 +553,17 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await query.message.reply_text(
             "📥 أرسل ملف JSON الخاص بالمشتركين لاستيراده.\n"
             "يجب أن يكون بنفس صيغة ملف النسخ الاحتياطي.\n\n"
-            "(أرسل /cancel للإلغاء)"
+            "_(أرسل /cancel للإلغاء)_",
+            parse_mode="Markdown",
         )
         return WAITING_IMPORT
 
     # ── نشر رسالة ──
     if data == "admin_broadcast":
         await query.message.reply_text(
-            "📢 أرسل الرسالة التي تريد نشرها لجميع المشتركين:\n"
-            "(أرسل /cancel للإلغاء)"
+            "📢 أرسل الرسالة التي تريد نشرها لجميع المشتركين النشطين:\n"
+            "_(أرسل /cancel للإلغاء)_",
+            parse_mode="Markdown",
         )
         return WAITING_BROADCAST
 
@@ -400,11 +580,11 @@ async def receive_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not is_admin(update.effective_user.id) or not is_authenticated(context):
         return ConversationHandler.END
 
-    message_text   = update.message.text
-    user_ids       = get_user_ids()
+    message_text    = update.message.text
+    user_ids        = get_user_ids()
     success, failed = 0, 0
 
-    await update.message.reply_text(f"⏳ جاري الإرسال لـ {len(user_ids)} مشترك...")
+    await update.message.reply_text(f"⏳ جاري الإرسال لـ {len(user_ids)} مشترك نشط...")
 
     for uid in user_ids:
         try:
@@ -414,11 +594,13 @@ async def receive_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             failed += 1
 
     await update.message.reply_text(
-        f"✅ تم الإرسال!\n\n"
+        f"✅ *تم الإرسال!*\n\n"
         f"✔️ نجح: {success}\n"
-        f"❌ فشل: {failed}"
+        f"❌ فشل: {failed}",
+        parse_mode="Markdown",
     )
-    return ConversationHandler.END
+    await show_admin_panel(update.message, context)
+    return WAITING_BROADCAST
 
 
 async def receive_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -431,44 +613,71 @@ async def receive_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return WAITING_IMPORT
 
     try:
-        tg_file = await doc.get_file()
-        raw     = await tg_file.download_as_bytearray()
+        tg_file  = await doc.get_file()
+        raw      = await tg_file.download_as_bytearray()
         imported = json.loads(raw.decode("utf-8"))
     except Exception as e:
         await update.message.reply_text(f"❌ فشل قراءة الملف: {e}")
         return WAITING_IMPORT
 
     if "users" not in imported:
-        await update.message.reply_text("❌ الملف لا يحتوي على مفتاح 'users'. تأكد أنه ملف نسخ احتياطي صحيح.")
+        await update.message.reply_text(
+            "❌ الملف لا يحتوي على مفتاح 'users'. تأكد أنه ملف نسخ احتياطي صحيح."
+        )
         return WAITING_IMPORT
 
-    current     = load_data()
-    existing_ids = {u["id"] for u in current["users"]}
-    added       = 0
+    # دمج — لا استبدال — حتى لا نضيع المشتركين الحاليين
+    added           = 0
+    skipped         = 0
+    raw_banned      = imported.get("banned", [])
+    imported_banned = []
 
-    for user in imported.get("users", []):
-        if isinstance(user, int):
-            # صيغة قديمة — تحويل
-            user = {"id": user, "first_name": "—", "username": None, "joined": "—"}
-        if user.get("id") not in existing_ids:
-            current["users"].append(user)
-            existing_ids.add(user["id"])
-            added += 1
+    # تحقق من صحة قائمة الحظر
+    for uid in raw_banned:
+        try:
+            imported_banned.append(int(uid))
+        except (TypeError, ValueError):
+            skipped += 1
 
-    # دمج قائمة الحظر
-    imported_banned = imported.get("banned", [])
-    for uid in imported_banned:
-        if uid not in current["banned"]:
-            current["banned"].append(uid)
+    with get_db() as conn:
+        for u in imported.get("users", []):
+            if isinstance(u, int):
+                u = {"id": u, "first_name": "—", "username": None, "joined": "—"}
+            # تحقق من وجود ID صحيح
+            try:
+                user_id = int(u.get("id"))
+            except (TypeError, ValueError):
+                skipped += 1
+                continue
+            result = conn.execute(
+                "INSERT OR IGNORE INTO users (id, first_name, last_name, username, joined) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    user_id,
+                    str(u.get("first_name") or "—"),
+                    str(u.get("last_name")  or ""),
+                    u.get("username"),
+                    str(u.get("joined")     or "—"),
+                ),
+            )
+            if result.rowcount:
+                added += 1
+        for uid in imported_banned:
+            conn.execute("INSERT OR IGNORE INTO banned (user_id) VALUES (?)", (uid,))
+        conn.commit()
 
-    save_data(current)
+    total = count_users()
+    skip_note = f"\n⚠️ سجلات متجاهلة (بيانات غير صالحة): {skipped}" if skipped else ""
     await update.message.reply_text(
-        f"✅ تم الاستيراد بنجاح!\n\n"
+        f"✅ *تم الاستيراد بنجاح!*\n\n"
         f"➕ مشتركون جدد مضافون: {added}\n"
         f"🚫 محظورون مستوردون: {len(imported_banned)}\n"
-        f"👥 إجمالي المشتركين الآن: {len(current['users'])}"
+        f"👥 إجمالي المشتركين الآن: {total}"
+        f"{skip_note}",
+        parse_mode="Markdown",
     )
-    return ConversationHandler.END
+    await show_admin_panel(update.message, context)
+    return WAITING_BROADCAST
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -555,7 +764,7 @@ async def send_night_prayer_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_white_days_reminder(context: ContextTypes.DEFAULT_TYPE):
-    today = datetime.now(TZ_RIYADH).date()
+    today     = datetime.now(TZ_RIYADH).date()
     hijri_day = Gregorian.fromdate(today).to_hijri().day
     if hijri_day not in (13, 14, 15):
         return
@@ -707,7 +916,6 @@ async def send_algeria_story(context: ContextTypes.DEFAULT_TYPE):
 # ─── بناء التطبيق ─────────────────────────────────────────────────
 
 def build_app():
-    """ينشئ تطبيقاً جديداً في كل مرة — ضروري لإعادة المحاولة الصحيحة."""
     token = (
         os.environ.get("TELEGRAM_TOKEN") or
         os.environ.get("BOT_TOKEN")       or
@@ -728,12 +936,12 @@ def build_app():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, check_password)
             ],
             WAITING_BROADCAST: [
-                CallbackQueryHandler(admin_button, pattern="^(admin_|user_|ban_|unban_)"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_broadcast)
+                CallbackQueryHandler(admin_button, pattern="^(admin_|user_|ban_|unban_|delete_)"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_broadcast),
             ],
             WAITING_IMPORT: [
                 MessageHandler(filters.Document.ALL, receive_import),
-                CallbackQueryHandler(admin_button, pattern="^(admin_|user_|ban_|unban_)"),
+                CallbackQueryHandler(admin_button, pattern="^(admin_|user_|ban_|unban_|delete_)"),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -758,10 +966,10 @@ def build_app():
 # ─── التشغيل ──────────────────────────────────────────────────────
 
 def main() -> None:
-    # تشخيص — يُظهر المفاتيح الموجودة فقط (بدون قيم)
-    watched = ("TELEGRAM_TOKEN", "BOT_TOKEN", "TOKEN", "ADMIN_ID", "ADMIN_PASSWORD", "PORT")
+    watched  = ("TELEGRAM_TOKEN", "BOT_TOKEN", "TOKEN", "ADMIN_ID", "ADMIN_PASSWORD", "PORT", "DATA_DIR")
     env_keys = [k for k in os.environ if k in watched]
     logger.info(f"🔑 متغيرات البيئة الموجودة: {env_keys}")
+    logger.info(f"💾 مسار قاعدة البيانات: {DB_FILE}")
 
     token = (
         os.environ.get("TELEGRAM_TOKEN") or
@@ -782,7 +990,10 @@ def main() -> None:
     else:
         logger.info(f"✅ المشرفون: {ADMIN_IDS}")
 
-    # تشغيل health check server في خيط منفصل (مرة واحدة فقط)
+    # تهيئة قاعدة البيانات (وترحيل JSON إن وجد)
+    init_db()
+    logger.info(f"✅ قاعدة البيانات جاهزة — {count_users()} مشترك مسجّل")
+
     health_thread = threading.Thread(target=start_health_server, daemon=True)
     health_thread.start()
 
@@ -792,13 +1003,13 @@ def main() -> None:
     while True:
         try:
             logger.info("🔄 جاري بناء التطبيق وبدء الـ polling...")
-            app = build_app()          # تطبيق جديد في كل محاولة
+            app = build_app()
             app.run_polling(drop_pending_updates=True)
             logger.info("ℹ️  توقف polling بشكل طبيعي.")
             break
         except RuntimeError as e:
             logger.error(f"❌ خطأ فادح: {e}")
-            raise SystemExit(1)        # خطأ في الإعداد — لا فائدة من إعادة المحاولة
+            raise SystemExit(1)
         except Exception as e:
             logger.error(f"⚠️  توقف البوت: {e}")
             logger.info(f"⏳ إعادة المحاولة خلال {retry_delay} ثانية...")
