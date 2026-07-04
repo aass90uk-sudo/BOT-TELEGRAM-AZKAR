@@ -59,7 +59,7 @@ WAITING_BROADCAST = 2
 
 def load_data() -> dict:
     if not os.path.exists(DATA_FILE):
-        return {"users": []}
+        return {"users": [], "banned": []}
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
     # ترحيل من الصيغة القديمة (قائمة IDs) إلى الجديدة
@@ -68,6 +68,10 @@ def load_data() -> dict:
             {"id": uid, "first_name": "—", "username": None, "joined": "—"}
             for uid in data["users"]
         ]
+        save_data(data)
+    # إضافة قائمة الحظر إن لم تكن موجودة
+    if "banned" not in data:
+        data["banned"] = []
         save_data(data)
     return data
 
@@ -78,7 +82,13 @@ def save_data(data: dict):
 
 
 def get_user_ids() -> list:
-    return [u["id"] for u in load_data()["users"]]
+    data = load_data()
+    banned = set(data.get("banned", []))
+    return [u["id"] for u in data["users"] if u["id"] not in banned]
+
+
+def is_banned(user_id: int) -> bool:
+    return user_id in load_data().get("banned", [])
 
 
 def find_user(user_id: int) -> dict | None:
@@ -117,6 +127,11 @@ async def show_admin_panel(target, context):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+
+    if is_banned(user.id):
+        await update.message.reply_text("عذراً، لا يمكنك استخدام هذا البوت.")
+        return
+
     data = load_data()
     ids  = [u["id"] for u in data["users"]]
 
@@ -246,29 +261,61 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         uname    = f"@{user['username']}" if user.get("username") else "لا يوجد"
         lname    = user.get("last_name", "")
         fullname = f"{user.get('first_name','—')} {lname}".strip()
+        banned   = is_banned(uid)
 
         # رابط فتح حسابه مباشرة في تليجرام
         if user.get("username"):
-            profile_link = f"https://t.me/{user['username']}"
-            link_btn     = InlineKeyboardButton("🔗 فتح الحساب", url=profile_link)
+            link_btn = InlineKeyboardButton("🔗 فتح الحساب", url=f"https://t.me/{user['username']}")
         else:
-            profile_link = f"tg://user?id={uid}"
-            link_btn     = InlineKeyboardButton("🔗 فتح الحساب", url=profile_link)
+            link_btn = InlineKeyboardButton("🔗 فتح الحساب", url=f"tg://user?id={uid}")
+
+        ban_btn = (
+            InlineKeyboardButton("✅ إلغاء الحظر", callback_data=f"unban_{uid}")
+            if banned else
+            InlineKeyboardButton("🚫 حظر المشترك", callback_data=f"ban_{uid}")
+        )
 
         keyboard = [
             [link_btn],
+            [ban_btn],
             [InlineKeyboardButton("◀️ رجوع للقائمة", callback_data="admin_stats")]
         ]
 
+        status = "🔴 محظور" if banned else "🟢 نشط"
         await query.message.reply_text(
             f"👤 بيانات المشترك\n"
             f"━━━━━━━━━━━━━━━━\n\n"
             f"📝 الاسم الكامل: {fullname}\n"
             f"🆔 المعرّف (ID): {uid}\n"
             f"📛 اليوزر: {uname}\n"
-            f"📅 تاريخ الانضمام: {user.get('joined','—')}",
+            f"📅 تاريخ الانضمام: {user.get('joined','—')}\n"
+            f"📌 الحالة: {status}",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+        return WAITING_BROADCAST
+
+    # ── حظر مشترك ──
+    if data.startswith("ban_"):
+        uid  = int(data.split("_")[1])
+        db   = load_data()
+        if uid not in db["banned"]:
+            db["banned"].append(uid)
+            save_data(db)
+        user = find_user(uid)
+        name = user.get("first_name", str(uid)) if user else str(uid)
+        await query.message.reply_text(f"🚫 تم حظر {name} ({uid}) بنجاح.\nلن يتلقى أي رسائل بعد الآن.")
+        return WAITING_BROADCAST
+
+    # ── إلغاء حظر مشترك ──
+    if data.startswith("unban_"):
+        uid  = int(data.split("_")[1])
+        db   = load_data()
+        if uid in db["banned"]:
+            db["banned"].remove(uid)
+            save_data(db)
+        user = find_user(uid)
+        name = user.get("first_name", str(uid)) if user else str(uid)
+        await query.message.reply_text(f"✅ تم إلغاء حظر {name} ({uid}).\nسيتلقى الرسائل مجدداً.")
         return WAITING_BROADCAST
 
     # ── نشر رسالة ──
@@ -434,7 +481,7 @@ def build_app():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, check_password)
             ],
             WAITING_BROADCAST: [
-                CallbackQueryHandler(admin_button, pattern="^(admin_|user_)"),
+                CallbackQueryHandler(admin_button, pattern="^(admin_|user_|ban_|unban_)"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_broadcast)
             ],
         },
