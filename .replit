@@ -32,3 +32,8 @@ outputType = "console"
 [[ports]]
 localPort = 8080
 externalPort = 80
+
+[userenv]
+
+[userenv.shared]
+WEBAPP_URL = "https://f89c1c19-da70-4dc7-9f64-8c1403b50e2e-00-1vnxwov1fowqa.pike.replit.dev"
