@@ -29,6 +29,6 @@ cd telegram_bot && python3 main.py
 - **21:05** — Story 2 (contemporary)
 
 ## Data storage
-Subscriber data is stored locally in `telegram_bot/users_data.json`.
+Subscriber data is stored in SQLite at `telegram_bot/bot.db`. The bot automatically migrates legacy `users_data.json` to SQLite on first run.
 
 ## User preferences

@@ -161,7 +161,11 @@ def start_health_server():
     server.serve_forever()
 
 
-BOT_TOKEN      = os.environ.get("TELEGRAM_TOKEN")
+BOT_TOKEN      = (
+    os.environ.get("TELEGRAM_TOKEN") or
+    os.environ.get("BOT_TOKEN")       or
+    os.environ.get("TOKEN")
+)
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 
 _raw_admins = os.environ.get("ADMIN_ID", "")
