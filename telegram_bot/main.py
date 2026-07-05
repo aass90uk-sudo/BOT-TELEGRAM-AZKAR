@@ -699,13 +699,7 @@ async def setup_admins(app) -> None:
                 commands=admin_commands,
                 scope=BotCommandScopeChat(chat_id=aid),
             )
-            # أرسل الزر لكل مشرف عند كل إعادة تشغيل حتى يظهر الزر دائماً
-            await app.bot.send_message(
-                chat_id=aid,
-                text="🔄 البوت يعمل — اضغط الزر أدناه لفتح لوحة التحكم.",
-                reply_markup=_admin_reply_keyboard(),
-            )
-            logger.info(f"✅ زر لوحة التحكم أُرسل للمشرف {aid}")
+            logger.info(f"✅ أوامر المشرف ضُبطت للمشرف {aid}")
         except Exception as e:
             logger.warning(f"⚠️ تعذّر إعداد المشرف {aid}: {e}")
 
