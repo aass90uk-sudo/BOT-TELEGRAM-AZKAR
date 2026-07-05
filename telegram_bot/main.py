@@ -25,7 +25,10 @@ from telegram import (
     BotCommandScopeChat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     MenuButtonWebApp,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
     WebAppInfo,
 )
@@ -617,23 +620,26 @@ def welcome_text(name: str) -> str:
     )
 
 
-# ─── دالة مساعدة: ضبط زر WebApp للمشرف ──────────────────────────────────────
+# ─── لوحة مفاتيح المشرف (ReplyKeyboard) ──────────────────────────────────────
 
-async def _set_admin_webapp_button(bot, admin_id: int):
-    """يضبط زر ⊞ لوحة التحكم في محادثة المشرف مع البوت."""
+def _admin_reply_keyboard() -> ReplyKeyboardMarkup | None:
+    """
+    يُنشئ ReplyKeyboardMarkup مع زر WebApp للوحة التحكم.
+    الزر ⊞ يظهر تلقائياً في حقل النص عند إرسال هذه اللوحة.
+    يُعيد None إذا لم يكن WEBAPP_URL محدداً.
+    """
     if not WEBAPP_URL:
-        return
-    try:
-        await bot.set_chat_menu_button(
-            chat_id=admin_id,
-            menu_button=MenuButtonWebApp(
+        return None
+    return ReplyKeyboardMarkup(
+        keyboard=[[
+            KeyboardButton(
                 text="🛠️ لوحة التحكم",
                 web_app=WebAppInfo(url=f"{WEBAPP_URL}/admin"),
-            ),
-        )
-        logger.info(f"✅ MenuButtonWebApp ← المشرف {admin_id}")
-    except Exception as e:
-        logger.warning(f"⚠️ تعذّر ضبط MenuButtonWebApp للمشرف {admin_id}: {e}")
+            )
+        ]],
+        resize_keyboard=True,
+        is_persistent=True,   # تبقى اللوحة ظاهرة دون أن يضغط المستخدم على ⊞
+    )
 
 
 # ─── /start ───────────────────────────────────────────────────────────────────
@@ -644,10 +650,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_banned(user.id):
         await update.message.reply_text("عذراً، لا يمكنك استخدام هذا البوت.")
         return
-
-    # للمشرفين: أعد ضبط زر ⊞ عند كل /start لضمان ظهوره حتى بعد تغيير الرابط
-    if is_admin(user.id):
-        await _set_admin_webapp_button(context.bot, user.id)
 
     if not user_exists(user.id):
         now = datetime.now(TZ_RIYADH).strftime("%Y-%m-%d %H:%M")
@@ -674,46 +676,64 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 pass
 
-    await update.message.reply_text(welcome_text(user.first_name))
+    # للمشرفين: أرسل لوحة المفاتيح مع زر WebApp — الزر ⊞ يظهر فوراً داخل حقل النص
+    if is_admin(user.id):
+        kb = _admin_reply_keyboard()
+        await update.message.reply_text(
+            welcome_text(user.first_name),
+            reply_markup=kb if kb else None,
+        )
+    else:
+        await update.message.reply_text(welcome_text(user.first_name))
 
 
 # ─── إعداد المشرفين عند بدء البوت (post_init) ────────────────────────────────
 
 async def setup_admins(app) -> None:
-    """يُشغَّل مرة واحدة عند انطلاق البوت: يضبط زر ⊞ وأوامر المشرف."""
+    """
+    يُشغَّل مرة واحدة عند انطلاق البوت.
+    يضبط أوامر المشرف، ويُرسل رسالة ترحيب مع لوحة مفاتيح ReplyKeyboard
+    تحتوي على زر WebApp — يُظهر الزر ⊞ داخل حقل النص فوراً.
+    """
     admin_commands = [
         BotCommand("start",  "▶️ رسالة الترحيب"),
-        BotCommand("admin",  "🛠️ لوحة التحكم"),
+        BotCommand("admin",  "🛠️ لوحة التحكم (نصي)"),
         BotCommand("cancel", "❌ إلغاء العملية الحالية"),
     ]
 
-    if WEBAPP_URL:
-        logger.info(f"🌐 WEBAPP_URL = {WEBAPP_URL}/admin")
+    kb = _admin_reply_keyboard()
+    if kb:
+        logger.info(f"🌐 WEBAPP_URL = {WEBAPP_URL}/admin (ReplyKeyboard جاهزة)")
     else:
-        logger.warning("⚠️ WEBAPP_URL غير محدد — زر ⊞ لن يظهر.")
+        logger.warning("⚠️ WEBAPP_URL غير محدد — لوحة مفاتيح WebApp لن تُرسل.")
 
     for aid in ADMIN_IDS:
         try:
-            await _set_admin_webapp_button(app.bot, aid)
+            # ضبط أوامر المشرف
             await app.bot.set_my_commands(
                 commands=admin_commands,
                 scope=BotCommandScopeChat(chat_id=aid),
             )
 
-            # رسالة الترحيب — مرة واحدة فقط
-            flag_key = f"welcome_sent_{aid}"
+            # رسالة الترحيب مع لوحة المفاتيح — مرة واحدة فقط
+            flag_key = f"welcome_sent_v2_{aid}"
             if not has_flag(flag_key):
-                hint = (
-                    "اضغط على زر *🛠️ لوحة التحكم* (⊞ بجانب حقل الكتابة) لفتح لوحة التحكم."
-                    if WEBAPP_URL else
-                    "أرسل /admin لفتح لوحة التحكم."
-                )
                 await app.bot.send_message(
                     chat_id=aid,
-                    text=welcome_text("مشرف") + f"\n\n🛠️ *ملاحظة للمشرف:*\n{hint}",
+                    text=(
+                        welcome_text("مشرف") + "\n\n"
+                        "🛠️ *ملاحظة للمشرف:*\n"
+                        + (
+                            "ستظهر لك لوحة المفاتيح مع زر *🛠️ لوحة التحكم* أسفل الشاشة — اضغطه لفتح لوحة التحكم مباشرةً."
+                            if kb else
+                            "أرسل /admin لفتح لوحة التحكم."
+                        )
+                    ),
+                    reply_markup=kb,
                     parse_mode="Markdown",
                 )
                 set_flag(flag_key)
+                logger.info(f"✅ رسالة ترحيب + ReplyKeyboard أُرسلت للمشرف {aid}")
         except Exception as e:
             logger.warning(f"⚠️ تعذّر إعداد المشرف {aid}: {e}")
 
