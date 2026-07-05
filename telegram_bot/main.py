@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import io
 import os
 import json
@@ -7,11 +9,12 @@ import threading
 import time
 from datetime import datetime, time as dt_time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs
 import pytz
 from hijri_converter import Gregorian
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    MenuButtonCommands, BotCommand, BotCommandScopeChat,
+    MenuButtonWebApp, WebAppInfo, BotCommand, BotCommandScopeChat,
 )
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes,
@@ -25,18 +28,117 @@ logger = logging.getLogger(__name__)
 
 BOT_START_TIME = datetime.utcnow()
 
+def _sync_telegram_send(chat_id: int, text: str) -> bool:
+    """إرسال رسالة مزامنة عبر HTTP مباشرة — يُستخدم من threads الـ WebApp API."""
+    import urllib.request as _ur
+    url  = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    body = json.dumps({"chat_id": chat_id, "text": text}).encode()
+    req  = _ur.Request(url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        _ur.urlopen(req, timeout=8)
+        return True
+    except Exception:
+        return False
+
+
 class HealthHandler(BaseHTTPRequestHandler):
+    # ── GET ──────────────────────────────────────────────────────────
     def do_GET(self):
-        uptime = (datetime.utcnow() - BOT_START_TIME).seconds
-        body   = (
-            f"status: ok\n"
-            f"uptime: {uptime}s\n"
-            f"bot: running\n"
-        ).encode()
+        if self.path.rstrip("/") == "/admin":
+            self._html(ADMIN_HTML)
+        else:
+            uptime = (datetime.utcnow() - BOT_START_TIME).seconds
+            self._text(f"status: ok\nuptime: {uptime}s\nbot: running\n")
+
+    # ── POST /api ─────────────────────────────────────────────────────
+    def do_POST(self):
+        if self.path != "/api":
+            self._json({"error": "not found"}, 404)
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            payload = json.loads(self.rfile.read(length))
+        except Exception:
+            self._json({"error": "invalid json"}, 400)
+            return
+
+        # ── تحقق من initData ──
+        user = _validate_init_data(payload.get("init_data", ""))
+        if not user or not is_admin(user.get("id", 0)):
+            self._json({"error": "unauthorized"}, 403)
+            return
+
+        action = payload.get("action", "")
+
+        if action == "stats":
+            total  = count_users()
+            banned = count_banned()
+            self._json({"total": total, "active": total - banned, "banned": banned})
+
+        elif action == "subscribers":
+            with get_db() as conn:
+                rows = conn.execute(
+                    "SELECT u.id, u.first_name, u.last_name, u.username, "
+                    "(SELECT 1 FROM banned b WHERE b.user_id=u.id) as banned "
+                    "FROM users u ORDER BY u.id DESC LIMIT 200"
+                ).fetchall()
+            users = [
+                {
+                    "id":         r["id"],
+                    "first_name": r["first_name"] or "—",
+                    "last_name":  r["last_name"]  or "",
+                    "username":   r["username"],
+                    "banned":     bool(r["banned"]),
+                }
+                for r in rows
+            ]
+            self._json({"users": users})
+
+        elif action == "broadcast":
+            text = (payload.get("text") or "").strip()
+            if not text:
+                self._json({"error": "نص الرسالة فارغ"}, 400)
+                return
+            user_ids = get_user_ids()
+            # إرسال في خيط منفصل حتى لا نحجب السيرفر
+            result = {"success": 0, "failed": 0}
+            def _run():
+                for uid in user_ids:
+                    if _sync_telegram_send(uid, text):
+                        result["success"] += 1
+                    else:
+                        result["failed"] += 1
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            t.join(timeout=30)   # انتظر 30 ث ثم أعد النتيجة
+            self._json(result)
+
+        else:
+            self._json({"error": "unknown action"}, 400)
+
+    # ── مساعدات ───────────────────────────────────────────────────────
+    def _html(self, body: str):
+        b = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def _text(self, body: str):
+        b = body.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(b)
+
+    def _json(self, data: dict, status: int = 200):
+        b = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(b)
 
     def log_message(self, format, *args):
         pass
@@ -55,10 +157,210 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 _raw_admins = os.environ.get("ADMIN_ID", "")
 ADMIN_IDS   = [int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdigit()]
 
+# رابط الـ WebApp — يجب ضبطه في Railway (مثال: https://my-bot.up.railway.app)
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "").rstrip("/")
+
 TZ_RIYADH = pytz.timezone("Asia/Riyadh")
 
 WAITING_BROADCAST = 1
 WAITING_IMPORT    = 2
+
+# ─── نص رسالة الترحيب ─────────────────────────────────────────────
+def welcome_text(name: str) -> str:
+    return (
+        f"السلام عليكم ورحمة الله وبركاته 🌿\n"
+        f"أهلاً وسهلاً بك يا {name} في البوت الإسلامي الدعوي.\n\n"
+        "هذا البوت يُرسل إليك يومياً:\n\n"
+        "🌄 قصة من أرض الجزائر الشامخة — الساعة 9:00 صباحاً\n"
+        "   (قصة من صالحي زماننا مع عبرتها وسؤالين للتأمل)\n\n"
+        "🌌 تنبيه قيام الليل — الساعة 2:00 فجراً\n\n"
+        "📚 قصتان إسلاميتان من السلف — الساعة 9:00 مساءً\n\n"
+        "📅 تذكير صيام الأيام البيض — أيام 13 و14 و15 من كل شهر هجري\n\n"
+        "نسأل الله أن ينفع بهذا البوت وأن يجعله في ميزان حسناتكم ☝🏻"
+    )
+
+# ─── HTML لوحة التحكم WebApp ──────────────────────────────────────
+ADMIN_HTML = """<!DOCTYPE html>
+<html dir="rtl" lang="ar">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>لوحة التحكم</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+  background:var(--tg-theme-bg-color,#fff);
+  color:var(--tg-theme-text-color,#222);
+  padding:12px 14px 24px;font-size:15px;
+}
+h1{font-size:17px;text-align:center;margin-bottom:14px;font-weight:700}
+.tab-bar{display:flex;gap:6px;margin-bottom:12px}
+.tab{
+  flex:1;padding:8px 4px;border:1.5px solid var(--tg-theme-hint-color,#bbb);
+  border-radius:10px;background:none;color:var(--tg-theme-text-color,#222);
+  font-size:13px;cursor:pointer;transition:.15s;
+}
+.tab.active{
+  background:var(--tg-theme-button-color,#2196F3);
+  color:var(--tg-theme-button-text-color,#fff);border-color:transparent;
+}
+.card{
+  background:var(--tg-theme-secondary-bg-color,#f4f4f4);
+  border-radius:14px;padding:14px 16px;margin-bottom:10px;
+}
+.row{display:flex;justify-content:space-between;align-items:center;
+  padding:8px 0;border-bottom:1px solid var(--tg-theme-hint-color,#ddd)}
+.row:last-child{border-bottom:none}
+.val{font-weight:700;font-size:16px;color:var(--tg-theme-link-color,#2196F3)}
+.badge{font-size:11px;padding:3px 8px;border-radius:8px;font-weight:600}
+.badge.active{background:#e8f5e9;color:#388e3c}
+.badge.banned{background:#ffebee;color:#c62828}
+textarea{
+  width:100%;border:1.5px solid var(--tg-theme-hint-color,#bbb);
+  border-radius:10px;padding:10px;font-size:14px;
+  background:var(--tg-theme-bg-color,#fff);
+  color:var(--tg-theme-text-color,#222);
+  resize:vertical;min-height:110px;margin-top:10px;outline:none;
+}
+textarea:focus{border-color:var(--tg-theme-button-color,#2196F3)}
+.btn{
+  width:100%;padding:13px;border:none;border-radius:12px;font-size:15px;
+  font-weight:700;cursor:pointer;margin-top:8px;transition:.2s;
+}
+.btn-primary{
+  background:var(--tg-theme-button-color,#2196F3);
+  color:var(--tg-theme-button-text-color,#fff);
+}
+.btn-primary:disabled{opacity:.45;cursor:default}
+.status{text-align:center;padding:8px 0;font-size:13px;
+  color:var(--tg-theme-hint-color,#888);min-height:24px}
+.hint{font-size:12px;color:var(--tg-theme-hint-color,#999);margin-top:4px}
+#panel-stats,#panel-subs,#panel-broadcast{display:none}
+#panel-stats.show,#panel-subs.show,#panel-broadcast.show{display:block}
+.loading{text-align:center;padding:20px;color:var(--tg-theme-hint-color,#888);font-size:14px}
+.user-row{display:flex;justify-content:space-between;align-items:center;
+  padding:9px 0;border-bottom:1px solid var(--tg-theme-hint-color,#eee)}
+.user-row:last-child{border-bottom:none}
+.user-name{font-size:14px}
+.user-id{font-size:11px;color:var(--tg-theme-hint-color,#999)}
+</style>
+</head>
+<body>
+<h1>🛠️ لوحة التحكم</h1>
+<div class="tab-bar">
+  <button class="tab active" onclick="showTab('stats')">📊 الإحصاء</button>
+  <button class="tab" onclick="showTab('subs')">👥 مشتركون</button>
+  <button class="tab" onclick="showTab('broadcast')">📢 بث</button>
+</div>
+
+<div id="panel-stats" class="show">
+  <div class="card" id="stats-card"><div class="loading">⏳ جاري التحميل...</div></div>
+</div>
+
+<div id="panel-subs">
+  <div class="card" id="subs-card"><div class="loading">⏳ جاري التحميل...</div></div>
+</div>
+
+<div id="panel-broadcast">
+  <div class="card">
+    <p style="font-weight:600">📢 رسالة للمشتركين النشطين</p>
+    <p class="hint">ستُرسل لجميع المشتركين غير المحظورين.</p>
+    <textarea id="bcast-text" placeholder="اكتب رسالتك هنا..."></textarea>
+    <div id="bcast-status" class="status"></div>
+    <button class="btn btn-primary" id="bcast-btn" onclick="sendBroadcast()">إرسال للجميع</button>
+  </div>
+</div>
+
+<script>
+const tg = window.Telegram.WebApp;
+tg.ready();
+tg.expand();
+const initData = tg.initData;
+const TABS = ['stats','subs','broadcast'];
+const LABELS = ['📊 الإحصاء','👥 مشتركون','📢 بث'];
+let statsLoaded = false, subsLoaded = false;
+
+function showTab(name) {
+  TABS.forEach((t,i) => {
+    document.getElementById('panel-'+t).classList.remove('show');
+    document.querySelectorAll('.tab')[i].classList.remove('active');
+  });
+  const idx = TABS.indexOf(name);
+  document.getElementById('panel-'+name).classList.add('show');
+  document.querySelectorAll('.tab')[idx].classList.add('active');
+  if(name==='stats' && !statsLoaded) loadStats();
+  if(name==='subs' && !subsLoaded) loadSubs();
+}
+
+async function api(action, extra={}) {
+  try {
+    const r = await fetch('/api', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({action, init_data: initData, ...extra})
+    });
+    return r.json();
+  } catch(e) { return {error: e.message}; }
+}
+
+async function loadStats() {
+  statsLoaded = true;
+  const d = await api('stats');
+  if(d.error){
+    document.getElementById('stats-card').innerHTML='<div class="loading">❌ '+d.error+'</div>';
+    return;
+  }
+  document.getElementById('stats-card').innerHTML = `
+    <div class="row"><span>👥 إجمالي المشتركين</span><span class="val">${d.total}</span></div>
+    <div class="row"><span>🟢 النشطون</span><span class="val">${d.active}</span></div>
+    <div class="row"><span>🔴 المحظورون</span><span class="val">${d.banned}</span></div>
+  `;
+}
+
+async function loadSubs() {
+  subsLoaded = true;
+  const d = await api('subscribers');
+  if(d.error){
+    document.getElementById('subs-card').innerHTML='<div class="loading">❌ '+d.error+'</div>';
+    return;
+  }
+  if(!d.users||!d.users.length){
+    document.getElementById('subs-card').innerHTML='<div class="loading">لا يوجد مشتركون بعد.</div>';
+    return;
+  }
+  document.getElementById('subs-card').innerHTML = d.users.map(u => `
+    <div class="user-row">
+      <div>
+        <div class="user-name">${escHtml(u.first_name+' '+(u.last_name||''))}</div>
+        <div class="user-id">${u.id}${u.username?' · @'+escHtml(u.username):''}</div>
+      </div>
+      <span class="badge ${u.banned?'banned':'active'}">${u.banned?'محظور':'نشط'}</span>
+    </div>
+  `).join('');
+}
+
+async function sendBroadcast() {
+  const text = document.getElementById('bcast-text').value.trim();
+  if(!text){ tg.showAlert('الرجاء كتابة رسالة أولاً.'); return; }
+  const btn = document.getElementById('bcast-btn');
+  const status = document.getElementById('bcast-status');
+  btn.disabled = true;
+  status.textContent = '⏳ جاري الإرسال...';
+  const d = await api('broadcast', {text});
+  btn.disabled = false;
+  if(d.error){ status.textContent='❌ '+d.error; return; }
+  status.textContent = `✅ نجح: ${d.success} | فشل: ${d.failed}`;
+  document.getElementById('bcast-text').value='';
+}
+
+function escHtml(s){ return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+loadStats();
+</script>
+</body>
+</html>"""
 
 # ─── قاعدة بيانات SQLite ──────────────────────────────────────────
 
@@ -268,6 +570,29 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+def _validate_init_data(init_data: str) -> dict | None:
+    """
+    تحقق من صحة initData الواردة من Telegram WebApp.
+    ترجع بيانات المستخدم (dict) أو None إذا كانت البيانات غير صالحة.
+    """
+    if not init_data or not BOT_TOKEN:
+        return None
+    try:
+        params = {k: v[0] for k, v in parse_qs(init_data, keep_blank_values=True).items()}
+        hash_val = params.pop("hash", None)
+        if not hash_val:
+            return None
+        data_check = "\n".join(f"{k}={v}" for k, v in sorted(params.items()))
+        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        computed   = hmac.new(secret_key, data_check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(computed, hash_val):
+            return None
+        return json.loads(params.get("user", "{}"))
+    except Exception as e:
+        logger.warning(f"initData validation error: {e}")
+        return None
+
+
 
 async def show_admin_panel(target, context):
     total  = count_users()
@@ -331,17 +656,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 pass
 
-    await update.message.reply_text(
-        f"السلام عليكم ورحمة الله وبركاته 🌿\n"
-        f"أهلاً وسهلاً بك يا {user.first_name} في البوت الإسلامي الدعوي.\n\n"
-        "هذا البوت يُرسل إليك يومياً:\n\n"
-        "🌄 قصة من أرض الجزائر الشامخة — الساعة 9:00 صباحاً\n"
-        "   (قصة من صالحي زماننا مع عبرتها وسؤالين للتأمل)\n\n"
-        "🌌 تنبيه قيام الليل — الساعة 2:00 فجراً\n\n"
-        "📚 قصتان إسلاميتان من السلف — الساعة 9:00 مساءً\n\n"
-        "📅 تذكير صيام الأيام البيض — أيام 13 و14 و15 من كل شهر هجري\n\n"
-        "نسأل الله أن ينفع بهذا البوت وأن يجعله في ميزان حسناتكم ☝🏻",
-    )
+    await update.message.reply_text(welcome_text(user.first_name))
 
 
 # ─── إعداد المشرفين عند بدء البوت ───────────────────────────────
@@ -350,41 +665,60 @@ async def setup_admins(app) -> None:
     """
     يُشغَّل مرة واحدة بعد انطلاق البوت (post_init).
     لكل مشرف:
-      1. يُثبّت زر القائمة المدمج (⊞) → MenuButtonCommands  (يتكرر عند كل إعادة تشغيل)
-      2. يضع /admin ضمن الأوامر الخاصة بمحادثته فقط         (يتكرر عند كل إعادة تشغيل)
-      3. يُرسل رسالة ترحيب — مرة واحدة فقط، تُحفظ في DB    (لا تتكرر بعد أول إرسال)
+      1. يُثبّت زر WebApp المدمج ⊞ إذا كان WEBAPP_URL مضبوطاً،
+         وإلا يُثبّت MenuButtonCommands (قائمة الأوامر) كبديل.
+      2. يضع /admin ضمن الأوامر الخاصة بمحادثة المشرف فقط.
+      3. يُرسل رسالة الترحيب مرة واحدة فقط (تُحفظ في DB).
     """
     admin_commands = [
-        BotCommand("admin",  "🛠️ لوحة التحكم"),
-        BotCommand("start",  "▶️ تشغيل البوت"),
+        BotCommand("start",  "▶️ بدء البوت / رسالة الترحيب"),
+        BotCommand("admin",  "🛠️ لوحة التحكم (نص بديل)"),
         BotCommand("cancel", "❌ إلغاء العملية الحالية"),
     ]
+
+    # اختر نوع زر القائمة
+    webapp_url = WEBAPP_URL
+    if webapp_url and webapp_url.startswith("https://"):
+        menu_button = MenuButtonWebApp(
+            text="🛠️ لوحة التحكم",
+            web_app=WebAppInfo(url=f"{webapp_url}/admin"),
+        )
+        logger.info(f"✅ سيُستخدم MenuButtonWebApp → {webapp_url}/admin")
+    else:
+        from telegram import MenuButtonCommands as _MBC
+        menu_button = _MBC()
+        logger.warning(
+            "⚠️  WEBAPP_URL غير مضبوط أو ليس HTTPS — "
+            "سيُستخدم MenuButtonCommands كبديل. "
+            "أضف WEBAPP_URL في Railway للحصول على لوحة التحكم المدمجة."
+        )
+
     for aid in ADMIN_IDS:
         try:
-            # 1. ثبّت زر القائمة المدمج (الأيقونة المربعة في حقل الكتابة)
-            await app.bot.set_chat_menu_button(
-                chat_id=aid,
-                menu_button=MenuButtonCommands(),
-            )
-            # 2. ضع أوامر المشرف مرئية فقط في محادثته
+            # 1. زر القائمة
+            await app.bot.set_chat_menu_button(chat_id=aid, menu_button=menu_button)
+
+            # 2. أوامر المشرف الخاصة
             await app.bot.set_my_commands(
                 commands=admin_commands,
                 scope=BotCommandScopeChat(chat_id=aid),
             )
             logger.info(f"✅ تم تثبيت زر القائمة والأوامر للمشرف: {aid}")
 
-            # 3. رسالة الترحيب — مرة واحدة فقط (نتحقق من DB)
+            # 3. رسالة الترحيب — مرة واحدة فقط
             flag_key = f"welcome_sent_{aid}"
             if not has_flag(flag_key):
+                if webapp_url and webapp_url.startswith("https://"):
+                    hint = (
+                        "اضغط على زر *⊞* (بجانب حقل الكتابة)\n"
+                        "لفتح لوحة التحكم — اضغط مجدداً لإغلاقها."
+                    )
+                else:
+                    hint = "أرسل /admin لفتح لوحة التحكم."
+
                 await app.bot.send_message(
                     chat_id=aid,
-                    text=(
-                        "🛠️ *مرحباً يا مشرف!*\n\n"
-                        "البوت يعمل الآن بنجاح ✅\n\n"
-                        "اضغط على زر *القائمة ⊞* (بجانب حقل الكتابة)\n"
-                        "ثم اختر */admin* — أو أرسل /admin مباشرةً —\n"
-                        "لفتح لوحة التحكم في أي وقت."
-                    ),
+                    text=welcome_text("مشرف") + f"\n\n🛠️ *ملاحظة للمشرف:*\n{hint}",
                     parse_mode="Markdown",
                 )
                 set_flag(flag_key)
