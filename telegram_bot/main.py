@@ -620,26 +620,20 @@ def welcome_text(name: str) -> str:
     )
 
 
-# ─── دالة مساعدة: ضبط زر WebApp الثابت في رأس حقل الكتابة ───────────────────
+# ─── لوحة مفاتيح المشرف (زر نصي بحت — بدون WebApp) ──────────────────────────
 
-async def _set_admin_webapp_button(bot, admin_id: int):
+def _admin_reply_keyboard() -> ReplyKeyboardMarkup:
     """
-    يضبط MenuButtonWebApp للمشرف — زر ⊞ ثابت في رأس حقل الكتابة لا يختفي.
-    مختلف تماماً عن ReplyKeyboardMarkup الذي يختفي عند النقر.
+    زر "🛠️ لوحة التحكم" في أسفل الشاشة.
+    • النقر عليه → البوت يرسل لوحة التحكم كرسالة عادية.
+    • النقر على ⊞ → يُظهر/يُخفي الزر.
+    • لا يفتح رابطاً ولا تطبيقاً مصغراً.
     """
-    if not WEBAPP_URL:
-        return
-    try:
-        await bot.set_chat_menu_button(
-            chat_id=admin_id,
-            menu_button=MenuButtonWebApp(
-                text="🛠️ لوحة التحكم",
-                web_app=WebAppInfo(url=f"{WEBAPP_URL}/admin"),
-            ),
-        )
-        logger.info(f"✅ MenuButtonWebApp ← المشرف {admin_id}")
-    except Exception as e:
-        logger.warning(f"⚠️ تعذّر ضبط MenuButtonWebApp للمشرف {admin_id}: {e}")
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton("🛠️ لوحة التحكم")]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
 # ─── /start ───────────────────────────────────────────────────────────────────
@@ -676,13 +670,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 pass
 
-    # للمشرفين: امسح أي ReplyKeyboard قديمة واضبط MenuButtonWebApp الثابت
+    # للمشرفين: أرسل لوحة المفاتيح مع زر لوحة التحكم
     if is_admin(user.id):
         await update.message.reply_text(
             welcome_text(user.first_name),
-            reply_markup=ReplyKeyboardRemove(),  # يمسح لوحة المفاتيح القديمة
+            reply_markup=_admin_reply_keyboard(),
         )
-        await _set_admin_webapp_button(context.bot, user.id)
     else:
         await update.message.reply_text(welcome_text(user.first_name))
 
@@ -692,9 +685,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def setup_admins(app) -> None:
     """
     يُشغَّل مرة واحدة عند انطلاق البوت.
-    - يمسح ReplyKeyboard القديمة (إن وُجدت)
-    - يضبط MenuButtonWebApp الثابت لكل مشرف
-    - يضبط أوامر المشرف
+    يضبط أوامر المشرف ويُرسل لوحة مفاتيح بزر "🛠️ لوحة التحكم".
     """
     admin_commands = [
         BotCommand("start",  "▶️ رسالة الترحيب"),
@@ -702,37 +693,19 @@ async def setup_admins(app) -> None:
         BotCommand("cancel", "❌ إلغاء العملية الحالية"),
     ]
 
-    if WEBAPP_URL:
-        logger.info(f"🌐 WEBAPP_URL = {WEBAPP_URL}/admin")
-    else:
-        logger.warning("⚠️ WEBAPP_URL غير محدد — زر لوحة التحكم لن يظهر.")
-
     for aid in ADMIN_IDS:
         try:
-            # اضبط MenuButtonWebApp الثابت
-            await _set_admin_webapp_button(app.bot, aid)
-
-            # ضبط أوامر المشرف
             await app.bot.set_my_commands(
                 commands=admin_commands,
                 scope=BotCommandScopeChat(chat_id=aid),
             )
-
-            # امسح ReplyKeyboard القديمة بإرسال رسالة صامتة مع ReplyKeyboardRemove
-            flag_key = f"keyboard_cleared_{aid}"
-            if not has_flag(flag_key):
-                await app.bot.send_message(
-                    chat_id=aid,
-                    text=(
-                        "✅ *تم تحديث لوحة التحكم*\n\n"
-                        "لوحة المفاتيح السابقة أُزيلت.\n"
-                        "اضغط /start لرؤية زر لوحة التحكم الجديد."
-                    ),
-                    reply_markup=ReplyKeyboardRemove(),
-                    parse_mode="Markdown",
-                )
-                set_flag(flag_key)
-                logger.info(f"✅ ReplyKeyboard مُسحت للمشرف {aid}")
+            # أرسل الزر لكل مشرف عند كل إعادة تشغيل حتى يظهر الزر دائماً
+            await app.bot.send_message(
+                chat_id=aid,
+                text="🔄 البوت يعمل — اضغط الزر أدناه لفتح لوحة التحكم.",
+                reply_markup=_admin_reply_keyboard(),
+            )
+            logger.info(f"✅ زر لوحة التحكم أُرسل للمشرف {aid}")
         except Exception as e:
             logger.warning(f"⚠️ تعذّر إعداد المشرف {aid}: {e}")
 
@@ -1232,21 +1205,29 @@ def build_app():
 
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(setup_admins).build()
 
+    _btn_filter = filters.TEXT & filters.Regex(r"^🛠️ لوحة التحكم$")
+
     admin_conv = ConversationHandler(
-        entry_points=[CommandHandler("admin", admin_entry)],
+        entry_points=[
+            CommandHandler("admin", admin_entry),
+            MessageHandler(_btn_filter, admin_entry),   # زر لوحة المفاتيح
+        ],
         states={
             WAITING_BROADCAST: [
                 CallbackQueryHandler(admin_button, pattern="^(admin_|user_|ban_|unban_|delete_)"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_broadcast),
+                MessageHandler(_btn_filter, admin_entry),          # إعادة فتح اللوحة
+                MessageHandler(filters.TEXT & ~filters.COMMAND & ~_btn_filter, receive_broadcast),
             ],
             WAITING_IMPORT: [
                 MessageHandler(filters.Document.ALL, receive_import),
                 CallbackQueryHandler(admin_button, pattern="^(admin_|user_|ban_|unban_|delete_)"),
+                MessageHandler(_btn_filter, admin_entry),
             ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
             CommandHandler("admin",  admin_entry),
+            MessageHandler(_btn_filter, admin_entry),
         ],
         per_user=True,
     )
