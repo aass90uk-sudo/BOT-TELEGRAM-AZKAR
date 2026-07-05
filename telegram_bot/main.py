@@ -52,10 +52,24 @@ class HealthHandler(BaseHTTPRequestHandler):
 
     # ── POST /api ─────────────────────────────────────────────────────
     def do_POST(self):
+        try:
+            self._handle_post()
+        except Exception as e:
+            logger.warning(f"HTTP POST error: {e}")
+            try:
+                self._json({"error": "internal server error"}, 500)
+            except Exception:
+                pass
+
+    def _handle_post(self):
         if self.path != "/api":
             self._json({"error": "not found"}, 404)
             return
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (ValueError, TypeError):
+            self._json({"error": "bad Content-Length"}, 400)
+            return
         try:
             payload = json.loads(self.rfile.read(length))
         except Exception:
@@ -100,18 +114,14 @@ class HealthHandler(BaseHTTPRequestHandler):
                 self._json({"error": "نص الرسالة فارغ"}, 400)
                 return
             user_ids = get_user_ids()
-            # إرسال في خيط منفصل حتى لا نحجب السيرفر
-            result = {"success": 0, "failed": 0}
-            def _run():
-                for uid in user_ids:
-                    if _sync_telegram_send(uid, text):
-                        result["success"] += 1
-                    else:
-                        result["failed"] += 1
-            t = threading.Thread(target=_run, daemon=True)
-            t.start()
-            t.join(timeout=30)   # انتظر 30 ث ثم أعد النتيجة
-            self._json(result)
+            # إرسال مزامن — بسيط ومضمون بدون race condition
+            success, failed = 0, 0
+            for uid in user_ids:
+                if _sync_telegram_send(uid, text):
+                    success += 1
+                else:
+                    failed += 1
+            self._json({"success": success, "failed": failed})
 
         else:
             self._json({"error": "unknown action"}, 400)
@@ -570,23 +580,39 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+_INIT_DATA_MAX_AGE = 600  # أقصى عمر مسموح لـ initData بالثواني (10 دقائق)
+
 def _validate_init_data(init_data: str) -> dict | None:
     """
     تحقق من صحة initData الواردة من Telegram WebApp.
-    ترجع بيانات المستخدم (dict) أو None إذا كانت البيانات غير صالحة.
+    - يتحقق من توقيع HMAC
+    - يرفض أي initData عمرها أكثر من 10 دقائق (حماية من إعادة الاستخدام)
+    يرجع بيانات المستخدم (dict) أو None إذا كانت البيانات غير صالحة.
     """
     if not init_data or not BOT_TOKEN:
         return None
     try:
-        params = {k: v[0] for k, v in parse_qs(init_data, keep_blank_values=True).items()}
+        params   = {k: v[0] for k, v in parse_qs(init_data, keep_blank_values=True).items()}
         hash_val = params.pop("hash", None)
         if not hash_val:
             return None
+
+        # ── تحقق من العمر ──────────────────────────────────────────
+        auth_date = int(params.get("auth_date", 0))
+        if auth_date == 0:
+            return None
+        age = int(time.time()) - auth_date
+        if age > _INIT_DATA_MAX_AGE:
+            logger.warning(f"initData expired (age={age}s)")
+            return None
+
+        # ── تحقق من التوقيع ────────────────────────────────────────
         data_check = "\n".join(f"{k}={v}" for k, v in sorted(params.items()))
         secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
         computed   = hmac.new(secret_key, data_check.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(computed, hash_val):
             return None
+
         return json.loads(params.get("user", "{}"))
     except Exception as e:
         logger.warning(f"initData validation error: {e}")
