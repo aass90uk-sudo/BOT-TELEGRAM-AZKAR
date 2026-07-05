@@ -11,7 +11,7 @@ import pytz
 from hijri_converter import Gregorian
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton
+    MenuButtonCommands, BotCommand, BotCommandScopeChat,
 )
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes,
@@ -60,8 +60,6 @@ TZ_RIYADH = pytz.timezone("Asia/Riyadh")
 WAITING_BROADCAST = 1
 WAITING_IMPORT    = 2
 
-ADMIN_PANEL_BTN = "🛠️ لوحة التحكم"
-
 # ─── قاعدة بيانات SQLite ──────────────────────────────────────────
 
 # مسار قابل للتهيئة عبر DATA_DIR (مفيد لـ Railway Volumes)
@@ -94,8 +92,25 @@ def init_db():
                 user_id INTEGER PRIMARY KEY
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_flags (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
         conn.commit()
     _migrate_json()
+
+
+def has_flag(key: str) -> bool:
+    with get_db() as conn:
+        return conn.execute("SELECT 1 FROM bot_flags WHERE key=?", (key,)).fetchone() is not None
+
+
+def set_flag(key: str, value: str = "1"):
+    with get_db() as conn:
+        conn.execute("INSERT OR REPLACE INTO bot_flags (key, value) VALUES (?,?)", (key, value))
+        conn.commit()
 
 
 def _migrate_json():
@@ -316,16 +331,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 pass
 
-    # لوحة مفاتيح دائمة للمشرف
-    if is_admin(user.id):
-        reply_markup = ReplyKeyboardMarkup(
-            [[KeyboardButton(ADMIN_PANEL_BTN)]],
-            resize_keyboard=True,
-            is_persistent=True,
-        )
-    else:
-        reply_markup = None
-
     await update.message.reply_text(
         f"السلام عليكم ورحمة الله وبركاته 🌿\n"
         f"أهلاً وسهلاً بك يا {user.first_name} في البوت الإسلامي الدعوي.\n\n"
@@ -336,11 +341,61 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📚 قصتان إسلاميتان من السلف — الساعة 9:00 مساءً\n\n"
         "📅 تذكير صيام الأيام البيض — أيام 13 و14 و15 من كل شهر هجري\n\n"
         "نسأل الله أن ينفع بهذا البوت وأن يجعله في ميزان حسناتكم ☝🏻",
-        reply_markup=reply_markup,
     )
 
 
-# ─── /admin والزر الدائم ──────────────────────────────────────────
+# ─── إعداد المشرفين عند بدء البوت ───────────────────────────────
+
+async def setup_admins(app) -> None:
+    """
+    يُشغَّل مرة واحدة بعد انطلاق البوت (post_init).
+    لكل مشرف:
+      1. يُثبّت زر القائمة المدمج (⊞) → MenuButtonCommands  (يتكرر عند كل إعادة تشغيل)
+      2. يضع /admin ضمن الأوامر الخاصة بمحادثته فقط         (يتكرر عند كل إعادة تشغيل)
+      3. يُرسل رسالة ترحيب — مرة واحدة فقط، تُحفظ في DB    (لا تتكرر بعد أول إرسال)
+    """
+    admin_commands = [
+        BotCommand("admin",  "🛠️ لوحة التحكم"),
+        BotCommand("start",  "▶️ تشغيل البوت"),
+        BotCommand("cancel", "❌ إلغاء العملية الحالية"),
+    ]
+    for aid in ADMIN_IDS:
+        try:
+            # 1. ثبّت زر القائمة المدمج (الأيقونة المربعة في حقل الكتابة)
+            await app.bot.set_chat_menu_button(
+                chat_id=aid,
+                menu_button=MenuButtonCommands(),
+            )
+            # 2. ضع أوامر المشرف مرئية فقط في محادثته
+            await app.bot.set_my_commands(
+                commands=admin_commands,
+                scope=BotCommandScopeChat(chat_id=aid),
+            )
+            logger.info(f"✅ تم تثبيت زر القائمة والأوامر للمشرف: {aid}")
+
+            # 3. رسالة الترحيب — مرة واحدة فقط (نتحقق من DB)
+            flag_key = f"welcome_sent_{aid}"
+            if not has_flag(flag_key):
+                await app.bot.send_message(
+                    chat_id=aid,
+                    text=(
+                        "🛠️ *مرحباً يا مشرف!*\n\n"
+                        "البوت يعمل الآن بنجاح ✅\n\n"
+                        "اضغط على زر *القائمة ⊞* (بجانب حقل الكتابة)\n"
+                        "ثم اختر */admin* — أو أرسل /admin مباشرةً —\n"
+                        "لفتح لوحة التحكم في أي وقت."
+                    ),
+                    parse_mode="Markdown",
+                )
+                set_flag(flag_key)
+                logger.info(f"✅ تم إرسال رسالة الترحيب للمشرف: {aid}")
+            else:
+                logger.info(f"ℹ️  رسالة الترحيب سبق إرسالها للمشرف: {aid}")
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر إعداد المشرف {aid}: {e}")
+
+
+# ─── /admin ──────────────────────────────────────────────────────
 
 async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_admin(update.effective_user.id):
@@ -562,6 +617,7 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     # ── نشر رسالة ──
     if data == "admin_broadcast":
+        context.user_data["awaiting_broadcast"] = True
         await query.message.reply_text(
             "📢 أرسل الرسالة التي تريد نشرها لجميع المشتركين النشطين:\n"
             "_(أرسل /cancel للإلغاء)_",
@@ -575,6 +631,17 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def receive_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
+
+    # لا تُرسل البث إلا إذا طلب المشرف صراحةً عبر زر "نشر رسالة"
+    if not context.user_data.get("awaiting_broadcast"):
+        await update.message.reply_text(
+            "ℹ️ اضغط على *📢 نشر رسالة للمشتركين* من لوحة التحكم أولاً.",
+            parse_mode="Markdown",
+        )
+        await show_admin_panel(update.message, context)
+        return WAITING_BROADCAST
+
+    context.user_data.pop("awaiting_broadcast", None)
 
     message_text    = update.message.text
     user_ids        = get_user_ids()
@@ -923,18 +990,22 @@ def build_app():
             "أضف أحد هذه المتغيرات: TELEGRAM_TOKEN أو BOT_TOKEN أو TOKEN"
         )
 
-    app = ApplicationBuilder().token(token).build()
+    app = (
+        ApplicationBuilder()
+        .token(token)
+        .post_init(setup_admins)
+        .build()
+    )
 
     admin_conv = ConversationHandler(
         entry_points=[
             CommandHandler("admin", admin_entry),
-            MessageHandler(filters.Regex(f"^{ADMIN_PANEL_BTN}$"), admin_entry),
         ],
         states={
             WAITING_BROADCAST: [
                 CallbackQueryHandler(admin_button, pattern="^(admin_|user_|ban_|unban_|delete_)"),
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{ADMIN_PANEL_BTN}$"),
+                    filters.TEXT & ~filters.COMMAND,
                     receive_broadcast,
                 ),
             ],
@@ -945,7 +1016,7 @@ def build_app():
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex(f"^{ADMIN_PANEL_BTN}$"), admin_entry),
+            CommandHandler("admin",  admin_entry),
         ],
         per_user=True,
     )
