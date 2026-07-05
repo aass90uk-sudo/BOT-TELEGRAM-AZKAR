@@ -171,7 +171,7 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 _raw_admins = os.environ.get("ADMIN_ID", "")
 ADMIN_IDS   = [int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdigit()]
 
-# رابط الـ WebApp — يُكتشف تلقائياً من Railway أو يُضبط يدوياً عبر WEBAPP_URL
+# رابط الـ WebApp — يُكتشف تلقائياً من Railway أو Replit أو يُضبط يدوياً عبر WEBAPP_URL
 def _detect_webapp_url() -> str:
     manual = os.environ.get("WEBAPP_URL", "").strip().rstrip("/")
     if manual:
@@ -180,6 +180,10 @@ def _detect_webapp_url() -> str:
     railway_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
     if railway_domain:
         return f"https://{railway_domain}"
+    # Replit يوفّر REPLIT_DEV_DOMAIN تلقائياً
+    replit_domain = os.environ.get("REPLIT_DEV_DOMAIN", "").strip()
+    if replit_domain:
+        return f"https://{replit_domain}"
     return ""
 
 WEBAPP_URL = _detect_webapp_url()
@@ -667,6 +671,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_banned(user.id):
         await update.message.reply_text("عذراً، لا يمكنك استخدام هذا البوت.")
         return
+
+    # ── زر ⊞ WebApp للمشرف: يُعاد ضبطه عند كل /start لضمان ظهوره دائماً ──
+    if is_admin(user.id) and WEBAPP_URL:
+        try:
+            await context.bot.set_chat_menu_button(
+                chat_id=user.id,
+                menu_button=MenuButtonWebApp(
+                    text="🛠️ لوحة التحكم",
+                    web_app=WebAppInfo(url=f"{WEBAPP_URL}/admin"),
+                ),
+            )
+            logger.info(f"✅ تم تحديث MenuButtonWebApp للمشرف {user.id} عبر /start")
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر ضبط MenuButtonWebApp للمشرف {user.id}: {e}")
 
     if not user_exists(user.id):
         now   = datetime.now(TZ_RIYADH).strftime("%Y-%m-%d %H:%M")
