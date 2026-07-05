@@ -624,13 +624,10 @@ def welcome_text(name: str) -> str:
 
 def _admin_reply_keyboard() -> ReplyKeyboardMarkup:
     """
-    زر "🛠️ لوحة التحكم" في أسفل الشاشة.
-    • النقر عليه → البوت يرسل لوحة التحكم كرسالة عادية.
-    • النقر على ⊞ → يُظهر/يُخفي الزر.
-    • لا يفتح رابطاً ولا تطبيقاً مصغراً.
+    زر أيقونة ⚙️ فقط بدون نص — يفتح لوحة التحكم عند الضغط.
     """
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton("🛠️ لوحة التحكم")]],
+        keyboard=[[KeyboardButton("⚙️")]],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -693,13 +690,33 @@ async def setup_admins(app) -> None:
         BotCommand("cancel", "❌ إلغاء العملية الحالية"),
     ]
 
+    APOLOGY = (
+        "واللهي يا حبابنا نتأسفو عليكم بزاف 😭😥\n\n"
+        "هاذي الأيام كانت كاينة شوية صيانة وتعديلات على البوت 🫣😌\n"
+        "وهذا خلّى رسائل كثيرة تجي عليكم بدون ما تستاهلوها 🥺💌\n\n"
+        "واللهي حشمتونا عليكم ☺️🥲\n"
+        "بصح دابا البوت ولّى مزيان ومستقر إن شاء الله 🥰\n\n"
+        "سامحونا على كل حاجة زعجتكم 🫂☺️\n"
+        "ونتمنّاو تبقاو معانا دايمًا 💌"
+    )
+
     for aid in ADMIN_IDS:
         try:
             await app.bot.set_my_commands(
                 commands=admin_commands,
                 scope=BotCommandScopeChat(chat_id=aid),
             )
-            logger.info(f"✅ أوامر المشرف ضُبطت للمشرف {aid}")
+            # رسالة الاعتذار — مرة واحدة فقط في تاريخ البوت
+            if not has_flag(f"apology_sent_{aid}"):
+                await app.bot.send_message(
+                    chat_id=aid,
+                    text=APOLOGY,
+                    reply_markup=_admin_reply_keyboard(),
+                )
+                set_flag(f"apology_sent_{aid}")
+                logger.info(f"✅ رسالة الاعتذار أُرسلت للمشرف {aid}")
+            else:
+                logger.info(f"✅ أوامر المشرف ضُبطت للمشرف {aid}")
         except Exception as e:
             logger.warning(f"⚠️ تعذّر إعداد المشرف {aid}: {e}")
 
@@ -1199,7 +1216,7 @@ def build_app():
 
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(setup_admins).build()
 
-    _btn_filter = filters.TEXT & filters.Regex(r"^🛠️ لوحة التحكم$")
+    _btn_filter = filters.TEXT & filters.Regex(r"^⚙️$")
 
     admin_conv = ConversationHandler(
         entry_points=[
