@@ -167,8 +167,18 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 _raw_admins = os.environ.get("ADMIN_ID", "")
 ADMIN_IDS   = [int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdigit()]
 
-# رابط الـ WebApp — يجب ضبطه في Railway (مثال: https://my-bot.up.railway.app)
-WEBAPP_URL = os.environ.get("WEBAPP_URL", "").rstrip("/")
+# رابط الـ WebApp — يُكتشف تلقائياً من Railway أو يُضبط يدوياً عبر WEBAPP_URL
+def _detect_webapp_url() -> str:
+    manual = os.environ.get("WEBAPP_URL", "").strip().rstrip("/")
+    if manual:
+        return manual
+    # Railway يوفّر RAILWAY_PUBLIC_DOMAIN تلقائياً
+    railway_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    if railway_domain:
+        return f"https://{railway_domain}"
+    return ""
+
+WEBAPP_URL = _detect_webapp_url()
 
 TZ_RIYADH = pytz.timezone("Asia/Riyadh")
 
@@ -691,40 +701,43 @@ async def setup_admins(app) -> None:
     """
     يُشغَّل مرة واحدة بعد انطلاق البوت (post_init).
     لكل مشرف:
-      1. يُثبّت زر WebApp المدمج ⊞ إذا كان WEBAPP_URL مضبوطاً،
-         وإلا يُثبّت MenuButtonCommands (قائمة الأوامر) كبديل.
-      2. يضع /admin ضمن الأوامر الخاصة بمحادثة المشرف فقط.
+      1. إذا توفّر WEBAPP_URL (HTTPS) → يثبّت MenuButtonWebApp:
+           زر ⊞ ملوّن ثابت يفتح لوحة التحكم عند الضغط ويغلقها عند الضغط مجدداً.
+         وإلا → يزيل أي زر مخصص (MenuButtonDefault) حتى لا يظهر نص "قائمة" المزعج.
+      2. يضع /admin و/start ضمن أوامر المشرف الخاصة.
       3. يُرسل رسالة الترحيب مرة واحدة فقط (تُحفظ في DB).
     """
+    from telegram import MenuButtonDefault
+
     admin_commands = [
-        BotCommand("start",  "▶️ بدء البوت / رسالة الترحيب"),
-        BotCommand("admin",  "🛠️ لوحة التحكم (نص بديل)"),
+        BotCommand("start",  "▶️ رسالة الترحيب"),
+        BotCommand("admin",  "🛠️ لوحة التحكم"),
         BotCommand("cancel", "❌ إلغاء العملية الحالية"),
     ]
 
-    # اختر نوع زر القائمة
     webapp_url = WEBAPP_URL
-    if webapp_url and webapp_url.startswith("https://"):
+    has_webapp  = bool(webapp_url and webapp_url.startswith("https://"))
+
+    if has_webapp:
         menu_button = MenuButtonWebApp(
             text="🛠️ لوحة التحكم",
             web_app=WebAppInfo(url=f"{webapp_url}/admin"),
         )
-        logger.info(f"✅ سيُستخدم MenuButtonWebApp → {webapp_url}/admin")
+        logger.info(f"✅ MenuButtonWebApp → {webapp_url}/admin")
     else:
-        from telegram import MenuButtonCommands as _MBC
-        menu_button = _MBC()
+        # لا يوجد WEBAPP_URL — نزيل الزر المخصص تماماً (لا "قائمة")
+        menu_button = MenuButtonDefault()
         logger.warning(
-            "⚠️  WEBAPP_URL غير مضبوط أو ليس HTTPS — "
-            "سيُستخدم MenuButtonCommands كبديل. "
-            "أضف WEBAPP_URL في Railway للحصول على لوحة التحكم المدمجة."
+            "⚠️  لم يُعثر على WEBAPP_URL HTTPS — تم إزالة زر القائمة. "
+            "أضف WEBAPP_URL في Railway للحصول على زر لوحة التحكم المدمج."
         )
 
     for aid in ADMIN_IDS:
         try:
-            # 1. زر القائمة
+            # 1. اضبط زر القائمة (WebApp أو بدون زر)
             await app.bot.set_chat_menu_button(chat_id=aid, menu_button=menu_button)
 
-            # 2. أوامر المشرف الخاصة
+            # 2. أوامر المشرف الخاصة بمحادثته فقط
             await app.bot.set_my_commands(
                 commands=admin_commands,
                 scope=BotCommandScopeChat(chat_id=aid),
@@ -734,14 +747,16 @@ async def setup_admins(app) -> None:
             # 3. رسالة الترحيب — مرة واحدة فقط
             flag_key = f"welcome_sent_{aid}"
             if not has_flag(flag_key):
-                if webapp_url and webapp_url.startswith("https://"):
+                if has_webapp:
                     hint = (
-                        "اضغط على زر *⊞* (بجانب حقل الكتابة)\n"
+                        "اضغط على زر *🛠️ لوحة التحكم* (⊞ بجانب حقل الكتابة)\n"
                         "لفتح لوحة التحكم — اضغط مجدداً لإغلاقها."
                     )
                 else:
-                    hint = "أرسل /admin لفتح لوحة التحكم."
-
+                    hint = (
+                        "أرسل /admin لفتح لوحة التحكم.\n"
+                        "_(لتفعيل زر ⊞ المدمج: أضف `WEBAPP_URL` في Railway)_"
+                    )
                 await app.bot.send_message(
                     chat_id=aid,
                     text=welcome_text("مشرف") + f"\n\n🛠️ *ملاحظة للمشرف:*\n{hint}",
