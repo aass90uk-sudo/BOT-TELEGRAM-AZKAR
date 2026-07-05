@@ -734,15 +734,25 @@ async def setup_admins(app) -> None:
 
     for aid in ADMIN_IDS:
         try:
-            # 1. اضبط زر القائمة (WebApp أو بدون زر)
+            # 1. اضبط زر القائمة (WebApp أو إزالة كاملة)
             await app.bot.set_chat_menu_button(chat_id=aid, menu_button=menu_button)
 
-            # 2. أوامر المشرف الخاصة بمحادثته فقط
-            await app.bot.set_my_commands(
-                commands=admin_commands,
-                scope=BotCommandScopeChat(chat_id=aid),
-            )
-            logger.info(f"✅ تم تثبيت زر القائمة والأوامر للمشرف: {aid}")
+            if has_webapp:
+                # 2a. مع WebApp: ضع أوامر المشرف في محادثته
+                await app.bot.set_my_commands(
+                    commands=admin_commands,
+                    scope=BotCommandScopeChat(chat_id=aid),
+                )
+                logger.info(f"✅ تم تثبيت MenuButtonWebApp والأوامر للمشرف: {aid}")
+            else:
+                # 2b. بدون WebApp: احذف أوامر المحادثة الخاصة حتى لا يظهر زر ☰
+                try:
+                    await app.bot.delete_my_commands(
+                        scope=BotCommandScopeChat(chat_id=aid),
+                    )
+                except Exception:
+                    pass
+                logger.info(f"✅ تم إزالة زر القائمة وأوامر المحادثة للمشرف: {aid}")
 
             # 3. رسالة الترحيب — مرة واحدة فقط
             flag_key = f"welcome_sent_{aid}"
