@@ -2,7 +2,7 @@
 البوت الإسلامي الدعوي الشامل
 ==============================
 يُرسل تنبيهات يومية (قيام الليل، قصص السلف، صيام الأيام البيض) لجميع المشتركين.
-لوحة تحكم WebApp مدمجة للمشرفين عبر زر ⊞ بجانب حقل الكتابة.
+لوحة تحكم المشرف عبارة عن أزرار ثابتة أسفل حقل الكتابة مباشرة.
 """
 
 import hashlib
@@ -29,11 +29,10 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
-    MenuButtonWebApp,
+    MenuButtonDefault,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     Update,
-    WebAppInfo,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -737,6 +736,16 @@ async def setup_admins(app) -> None:
             logger.info(f"✅ أوامر المشرف ضُبطت للمشرف {aid}")
         except Exception as e:
             logger.warning(f"⚠️ تعذّر إعداد المشرف {aid}: {e}")
+
+        # إزالة زر قائمة الـ WebApp القديم "⊞ لوحة التحكم" بجانب حقل الكتابة
+        # (أصبح غير ضروري بعد إضافة لوحة الأزرار السفلية الجديدة).
+        try:
+            await app.bot.set_chat_menu_button(
+                chat_id=aid,
+                menu_button=MenuButtonDefault(),
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر إزالة زر القائمة القديم للمشرف {aid}: {e}")
 
 
 # ─── /admin ───────────────────────────────────────────────────────────────────
