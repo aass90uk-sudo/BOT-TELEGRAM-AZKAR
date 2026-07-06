@@ -164,6 +164,20 @@ def set_flag(key: str, value: str = "1"):
         conn.commit()
 
 
+def get_and_increment_magazine_page(total: int) -> int:
+    """يُعيد رقم الصفحة الحالية (0-based) ثم يُحدّثها للصفحة التالية دورياً."""
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM bot_flags WHERE key='magazine_page'").fetchone()
+        idx = int(row[0]) if row else 0
+        next_idx = (idx + 1) % total
+        conn.execute(
+            "INSERT OR REPLACE INTO bot_flags (key, value) VALUES ('magazine_page', ?)",
+            (str(next_idx),)
+        )
+        conn.commit()
+    return idx
+
+
 def add_user(entry: dict):
     with get_db() as conn:
         conn.execute(
@@ -1068,6 +1082,63 @@ async def send_white_days_reminder(context: ContextTypes.DEFAULT_TYPE):
     ))
 
 
+# ─── مجلة حفيدات الخنساء — صفحة صباحاً وصفحة مساءً ────────────────────────
+
+_MAGAZINE_DIR   = os.path.join(_BASE_DIR, "magazine")
+_MAGAZINE_IMAGES = os.path.join(_MAGAZINE_DIR, "images")
+_MAGAZINE_PAGES_JSON = os.path.join(_MAGAZINE_DIR, "pages.json")
+
+def _load_magazine_pages() -> list:
+    try:
+        with open(_MAGAZINE_PAGES_JSON, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+async def _send_magazine_page(context: ContextTypes.DEFAULT_TYPE, slot: str):
+    """يُرسل الصفحة التالية من المجلة (صورة + نص) لجميع المشتركين."""
+    pages = _load_magazine_pages()
+    if not pages:
+        return
+
+    idx   = get_and_increment_magazine_page(len(pages))
+    page  = pages[idx]
+    num   = page["page"]
+    text  = page.get("text", "").strip()
+    img   = os.path.join(_MAGAZINE_IMAGES, f"page_{num:03d}.jpg")
+
+    caption = (
+        f"📖 مجلة حفيدات الخنساء\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📄 الصفحة {num} من 45  |  {slot}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{text[:900] if text else '— صفحة مصوّرة —'}"
+    )
+
+    for uid in get_user_ids():
+        try:
+            if os.path.exists(img):
+                with open(img, "rb") as photo:
+                    await context.bot.send_photo(
+                        chat_id=uid,
+                        photo=photo,
+                        caption=caption,
+                    )
+            else:
+                await context.bot.send_message(chat_id=uid, text=caption)
+        except Exception:
+            continue
+
+
+async def send_magazine_morning(context: ContextTypes.DEFAULT_TYPE):
+    await _send_magazine_page(context, "🌅 نشرة الصباح")
+
+
+async def send_magazine_evening(context: ContextTypes.DEFAULT_TYPE):
+    await _send_magazine_page(context, "🌙 نشرة المساء")
+
+
 # ─── همسات وخواطر إسلامية — تتجدد يومياً ───────────────────────────────────
 
 ISLAMIC_WHISPERS = [
@@ -1921,11 +1992,13 @@ def build_app():
 
     jq = app.job_queue
     tz = TZ_RIYADH
+    jq.run_daily(send_night_prayer_reminder, time=dt_time(2,  0,  tzinfo=tz))  # قيام الليل
     jq.run_daily(send_daily_whisper,         time=dt_time(7,  0,  tzinfo=tz))  # همسة صباحية
+    jq.run_daily(send_white_days_reminder,   time=dt_time(8,  0,  tzinfo=tz))  # الأيام البيض
+    jq.run_daily(send_magazine_morning,      time=dt_time(8, 30,  tzinfo=tz))  # مجلة صباح
     jq.run_daily(send_algeria_story,         time=dt_time(9,  0,  tzinfo=tz))  # قصة الجزائر
     jq.run_daily(send_oppressed_dua,         time=dt_time(15, 0,  tzinfo=tz))  # دعاء المستضعفين
-    jq.run_daily(send_night_prayer_reminder, time=dt_time(2,  0,  tzinfo=tz))  # قيام الليل
-    jq.run_daily(send_white_days_reminder,   time=dt_time(8,  0,  tzinfo=tz))  # الأيام البيض
+    jq.run_daily(send_magazine_evening,      time=dt_time(19, 0,  tzinfo=tz))  # مجلة مساء
     jq.run_daily(send_stories_announcement,  time=dt_time(20, 45, tzinfo=tz))  # تنبيه القصص
     jq.run_daily(send_story_one,             time=dt_time(21, 0,  tzinfo=tz))  # طرائف السلف
     jq.run_daily(send_story_two,             time=dt_time(21, 5,  tzinfo=tz))  # المرابطون
