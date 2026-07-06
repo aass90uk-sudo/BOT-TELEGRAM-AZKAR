@@ -690,39 +690,13 @@ async def setup_admins(app) -> None:
         BotCommand("cancel", "❌ إلغاء العملية الحالية"),
     ]
 
-    APOLOGY_V2 = (
-        "واللهي يا حبابنا 😌\n\n"
-        "نتأسفو عليكم بزاف على الأيام اللي فاتت 🥺😥\n"
-        "البوت كان في مرحلة تعديلات وتحسينات وهذا خلّى رسائل مزعجة تجي عليكم 😭\n\n"
-        "واللهي حشمتونا عليكم ☺️🥲\n\n"
-        "بصح البشارة أن البوت دابا ولّى أحسن وأمزيان 🥰\n\n"
-        "✨ أهم اللي تبدّل:\n"
-        "• الساعة 9 مساءً: قصتين جديدتين كل يوم 📚\n"
-        "   🎭 طرفة من طرائف السلف الصالح\n"
-        "   🌙 قصة من واقع المرابطين الصابرين\n"
-        "• بعد كل قصة: العبرة والعضة + سؤالين مع خيارين للجواب ✅\n"
-        "• لا تكرار — كل يوم قصص جديدة مختلفة 🔄\n\n"
-        "سامحونا على كل حاجة 🫂☺️💌\n"
-        "ونتمنّاو تبقاو معانا دايمًا 🥰"
-    )
-
     for aid in ADMIN_IDS:
         try:
             await app.bot.set_my_commands(
                 commands=admin_commands,
                 scope=BotCommandScopeChat(chat_id=aid),
             )
-            # رسالة الاعتذار v2 — مرة واحدة فقط
-            if not has_flag(f"apology_v2_sent_{aid}"):
-                await app.bot.send_message(
-                    chat_id=aid,
-                    text=APOLOGY_V2,
-                    reply_markup=_admin_reply_keyboard(),
-                )
-                set_flag(f"apology_v2_sent_{aid}")
-                logger.info(f"✅ رسالة الاعتذار v2 أُرسلت للمشرف {aid}")
-            else:
-                logger.info(f"✅ أوامر المشرف ضُبطت للمشرف {aid}")
+            logger.info(f"✅ أوامر المشرف ضُبطت للمشرف {aid}")
         except Exception as e:
             logger.warning(f"⚠️ تعذّر إعداد المشرف {aid}: {e}")
 
