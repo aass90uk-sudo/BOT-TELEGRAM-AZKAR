@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -639,12 +640,32 @@ def welcome_text(name: str) -> str:
 
 # ─── لوحة مفاتيح المشرف (زر نصي بحت — بدون WebApp) ──────────────────────────
 
+ADMIN_BTN_STATS     = "👥 المشتركون"
+ADMIN_BTN_BROADCAST = "📢 نشر رسالة"
+ADMIN_BTN_BANNED    = "🚫 المحظورون"
+ADMIN_BTN_BACKUP    = "📦 نسخة احتياطية"
+ADMIN_BTN_IMPORT    = "📥 استيراد مشتركين"
+
+ADMIN_MENU_LABELS = {
+    ADMIN_BTN_STATS,
+    ADMIN_BTN_BROADCAST,
+    ADMIN_BTN_BANNED,
+    ADMIN_BTN_BACKUP,
+    ADMIN_BTN_IMPORT,
+}
+
+
 def _admin_reply_keyboard() -> ReplyKeyboardMarkup:
     """
-    زر أيقونة ⚙️ فقط بدون نص — يفتح لوحة التحكم عند الضغط.
+    لوحة مفاتيح ثابتة تحت حقل الكتابة تحتوي على كل أزرار لوحة التحكم الفرعية
+    مباشرة — بدون الحاجة للضغط على زر وسيط لفتحها.
     """
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton("⚙️")]],
+        keyboard=[
+            [KeyboardButton(ADMIN_BTN_STATS), KeyboardButton(ADMIN_BTN_BROADCAST)],
+            [KeyboardButton(ADMIN_BTN_BANNED), KeyboardButton(ADMIN_BTN_BACKUP)],
+            [KeyboardButton(ADMIN_BTN_IMPORT)],
+        ],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -745,10 +766,131 @@ async def show_admin_panel(target, context):
         await target.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
 
 
+async def send_stats_list(message):
+    users = load_data()["users"]
+    if not users:
+        await message.reply_text("لا يوجد مشتركون بعد.")
+        return
+    await message.reply_text(
+        f"📊 *إجمالي المشتركين: {len(users)} عضو*\nاضغط على أي اسم لرؤية تفاصيله:",
+        parse_mode="Markdown",
+    )
+    chunk_size = 10
+    for i in range(0, len(users), chunk_size):
+        chunk = users[i:i + chunk_size]
+        keyboard = []
+        for u in chunk:
+            mark  = "🔴 " if is_banned(u["id"]) else "🟢 "
+            label = f"{mark}{u.get('first_name','—')} {u.get('last_name','')}".strip()
+            keyboard.append([InlineKeyboardButton(
+                f"{label}  |  {u['id']}", callback_data=f"user_{u['id']}"
+            )])
+        await message.reply_text(
+            f"المشتركون {i + 1}–{min(i + chunk_size, len(users))}:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+
+async def send_banned_list(message):
+    with get_db() as conn:
+        banned_ids = [r[0] for r in conn.execute("SELECT user_id FROM banned").fetchall()]
+    if not banned_ids:
+        await message.reply_text("✅ لا يوجد أي مشترك محظور حالياً.")
+        return
+    keyboard = []
+    for uid in banned_ids:
+        u = find_user(uid)
+        if u:
+            keyboard.append([InlineKeyboardButton(
+                f"🔴 {u.get('first_name','—')}  |  {uid}", callback_data=f"user_{uid}"
+            )])
+        else:
+            keyboard.append([
+                InlineKeyboardButton(f"🔴 {uid}",        callback_data=f"user_{uid}"),
+                InlineKeyboardButton("✅ رفع الحظر",      callback_data=f"unban_{uid}"),
+                InlineKeyboardButton("🗑️ حذف",            callback_data=f"delete_{uid}"),
+            ])
+    keyboard.append([InlineKeyboardButton("◀️ رجوع", callback_data="admin_home")])
+    await message.reply_text(
+        f"🚫 *المحظورون ({len(banned_ids)}):*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+    )
+
+
+async def send_backup_file(message):
+    db  = load_data()
+    raw = json.dumps(db, ensure_ascii=False, indent=2).encode("utf-8")
+    bio = io.BytesIO(raw)
+    bio.name = "users_data.json"
+    await message.reply_document(
+        document=bio,
+        filename="users_data.json",
+        caption=(
+            f"📦 *نسخة احتياطية*\n"
+            f"👥 {len(db['users'])} مشترك\n"
+            f"🚫 {len(db.get('banned',[]))} محظور\n"
+            f"📅 {datetime.now(TZ_RIYADH).strftime('%Y-%m-%d %H:%M')}"
+        ),
+        parse_mode="Markdown",
+    )
+
+
+async def prompt_broadcast(message, context):
+    context.user_data["awaiting_broadcast"] = True
+    await message.reply_text(
+        "📢 أرسل الرسالة للمشتركين النشطين:\n_(أرسل /cancel للإلغاء)_",
+        parse_mode="Markdown",
+    )
+
+
+async def prompt_import(message):
+    await message.reply_text(
+        "📥 أرسل ملف JSON لاستيراد المشتركين.\n_(أرسل /cancel للإلغاء)_",
+        parse_mode="Markdown",
+    )
+
+
 async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔️ هذا الأمر للمشرفين فقط.")
         return ConversationHandler.END
+    await show_admin_panel(update.message, context)
+    return WAITING_BROADCAST
+
+
+async def admin_menu_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    نقطة دخول للأزرار الفرعية الظاهرة مباشرة في لوحة المفاتيح السفلية
+    (تحت حقل الكتابة) — كل زر ينفّذ إجراءه مباشرة دون المرور بلوحة وسيطة.
+    """
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔️ هذا الأمر للمشرفين فقط.")
+        return ConversationHandler.END
+
+    text = update.message.text
+
+    if text == ADMIN_BTN_STATS:
+        await send_stats_list(update.message)
+        return WAITING_BROADCAST
+
+    if text == ADMIN_BTN_BROADCAST:
+        await prompt_broadcast(update.message, context)
+        return WAITING_BROADCAST
+
+    if text == ADMIN_BTN_BANNED:
+        await send_banned_list(update.message)
+        return WAITING_BROADCAST
+
+    if text == ADMIN_BTN_BACKUP:
+        await send_backup_file(update.message)
+        return WAITING_BROADCAST
+
+    if text == ADMIN_BTN_IMPORT:
+        await prompt_import(update.message)
+        return WAITING_IMPORT
+
+    # أمر /admin أو أي حالة أخرى — يعرض لوحة النظرة العامة الكلاسيكية
     await show_admin_panel(update.message, context)
     return WAITING_BROADCAST
 
@@ -768,28 +910,7 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return WAITING_BROADCAST
 
     if data == "admin_stats":
-        users = load_data()["users"]
-        if not users:
-            await query.message.reply_text("لا يوجد مشتركون بعد.")
-            return WAITING_BROADCAST
-        await query.message.reply_text(
-            f"📊 *إجمالي المشتركين: {len(users)} عضو*\nاضغط على أي اسم لرؤية تفاصيله:",
-            parse_mode="Markdown",
-        )
-        chunk_size = 10
-        for i in range(0, len(users), chunk_size):
-            chunk = users[i:i + chunk_size]
-            keyboard = []
-            for u in chunk:
-                mark  = "🔴 " if is_banned(u["id"]) else "🟢 "
-                label = f"{mark}{u.get('first_name','—')} {u.get('last_name','')}".strip()
-                keyboard.append([InlineKeyboardButton(
-                    f"{label}  |  {u['id']}", callback_data=f"user_{u['id']}"
-                )])
-            await query.message.reply_text(
-                f"المشتركون {i + 1}–{min(i + chunk_size, len(users))}:",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-            )
+        await send_stats_list(query.message)
         return WAITING_BROADCAST
 
     if data.startswith("user_"):
@@ -877,63 +998,19 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return WAITING_BROADCAST
 
     if data == "admin_banned":
-        with get_db() as conn:
-            banned_ids = [r[0] for r in conn.execute("SELECT user_id FROM banned").fetchall()]
-        if not banned_ids:
-            await query.message.reply_text("✅ لا يوجد أي مشترك محظور حالياً.")
-            return WAITING_BROADCAST
-        keyboard = []
-        for uid in banned_ids:
-            u = find_user(uid)
-            if u:
-                keyboard.append([InlineKeyboardButton(
-                    f"🔴 {u.get('first_name','—')}  |  {uid}", callback_data=f"user_{uid}"
-                )])
-            else:
-                keyboard.append([
-                    InlineKeyboardButton(f"🔴 {uid}",        callback_data=f"user_{uid}"),
-                    InlineKeyboardButton("✅ رفع الحظر",      callback_data=f"unban_{uid}"),
-                    InlineKeyboardButton("🗑️ حذف",            callback_data=f"delete_{uid}"),
-                ])
-        keyboard.append([InlineKeyboardButton("◀️ رجوع", callback_data="admin_home")])
-        await query.message.reply_text(
-            f"🚫 *المحظورون ({len(banned_ids)}):*",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown",
-        )
+        await send_banned_list(query.message)
         return WAITING_BROADCAST
 
     if data == "admin_backup":
-        db  = load_data()
-        raw = json.dumps(db, ensure_ascii=False, indent=2).encode("utf-8")
-        bio = io.BytesIO(raw)
-        bio.name = "users_data.json"
-        await query.message.reply_document(
-            document=bio,
-            filename="users_data.json",
-            caption=(
-                f"📦 *نسخة احتياطية*\n"
-                f"👥 {len(db['users'])} مشترك\n"
-                f"🚫 {len(db.get('banned',[]))} محظور\n"
-                f"📅 {datetime.now(TZ_RIYADH).strftime('%Y-%m-%d %H:%M')}"
-            ),
-            parse_mode="Markdown",
-        )
+        await send_backup_file(query.message)
         return WAITING_BROADCAST
 
     if data == "admin_import":
-        await query.message.reply_text(
-            "📥 أرسل ملف JSON لاستيراد المشتركين.\n_(أرسل /cancel للإلغاء)_",
-            parse_mode="Markdown",
-        )
+        await prompt_import(query.message)
         return WAITING_IMPORT
 
     if data == "admin_broadcast":
-        context.user_data["awaiting_broadcast"] = True
-        await query.message.reply_text(
-            "📢 أرسل الرسالة للمشتركين النشطين:\n_(أرسل /cancel للإلغاء)_",
-            parse_mode="Markdown",
-        )
+        await prompt_broadcast(query.message, context)
         return WAITING_BROADCAST
 
     return WAITING_BROADCAST
@@ -1905,29 +1982,30 @@ def build_app():
 
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(setup_admins).build()
 
-    _btn_filter = filters.TEXT & filters.Regex(r"^⚙️$")
+    _menu_pattern = "^(" + "|".join(re.escape(lbl) for lbl in ADMIN_MENU_LABELS) + ")$"
+    _btn_filter = filters.TEXT & filters.Regex(_menu_pattern)
 
     admin_conv = ConversationHandler(
         entry_points=[
             CommandHandler("admin", admin_entry),
-            MessageHandler(_btn_filter, admin_entry),   # زر لوحة المفاتيح
+            MessageHandler(_btn_filter, admin_menu_entry),   # أزرار لوحة التحكم السفلية
         ],
         states={
             WAITING_BROADCAST: [
                 CallbackQueryHandler(admin_button, pattern="^(admin_|user_|ban_|unban_|delete_)"),
-                MessageHandler(_btn_filter, admin_entry),          # إعادة فتح اللوحة
+                MessageHandler(_btn_filter, admin_menu_entry),     # الانتقال لزر آخر من اللوحة
                 MessageHandler(filters.TEXT & ~filters.COMMAND & ~_btn_filter, receive_broadcast),
             ],
             WAITING_IMPORT: [
                 MessageHandler(filters.Document.ALL, receive_import),
                 CallbackQueryHandler(admin_button, pattern="^(admin_|user_|ban_|unban_|delete_)"),
-                MessageHandler(_btn_filter, admin_entry),
+                MessageHandler(_btn_filter, admin_menu_entry),
             ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
             CommandHandler("admin",  admin_entry),
-            MessageHandler(_btn_filter, admin_entry),
+            MessageHandler(_btn_filter, admin_menu_entry),
         ],
         per_user=True,
     )
