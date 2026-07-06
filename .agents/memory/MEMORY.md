@@ -1,1 +1,2 @@
 - [Deployment topology](deployment-topology.md) — this bot runs live on Railway; Replit is code-editing only, no running workflow, to avoid Telegram getUpdates polling conflicts.
+- [Git push workaround](git-push-workaround.md) — plain `git push origin main` hangs here; use GITHUB_PAT HTTPS URL from a background task instead.
