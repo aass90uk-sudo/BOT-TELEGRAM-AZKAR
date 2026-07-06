@@ -1,0 +1,1 @@
+- [Deployment topology](deployment-topology.md) — this bot runs live on Railway; Replit is code-editing only, no running workflow, to avoid Telegram getUpdates polling conflicts.
