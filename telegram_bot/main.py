@@ -1486,12 +1486,21 @@ MURABITEEN_STORIES = [
 ]
 
 
+def _story_callback(story_set: str, idx: int, q: int, choice: str) -> str:
+    """ينشئ callback_data مضغوطاً — أقصر من 64 بايت دائماً.
+    صيغة: sq_{s|m}_{idx}_{q}_{a|b}
+    """
+    return f"sq_{story_set}_{idx}_{q}_{choice}"
+
+
 async def _send_story_with_quiz(
     context: ContextTypes.DEFAULT_TYPE,
     header: str,
     story: dict,
+    story_set: str,
+    story_idx: int,
 ):
-    """إرسال قصة مع عبرة وعضة وسؤالين بخيارين (أزرار inline)."""
+    """إرسال قصة مع عبرة وعضة وسؤالين بخيارين قابلين للتحقق (inline)."""
     text = (
         f"{header}\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1507,12 +1516,24 @@ async def _send_story_with_quiz(
     )
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(story["q1a"], callback_data="sq_1_a"),
-            InlineKeyboardButton(story["q1b"], callback_data="sq_1_b"),
+            InlineKeyboardButton(
+                story["q1a"],
+                callback_data=_story_callback(story_set, story_idx, 1, "a"),
+            ),
+            InlineKeyboardButton(
+                story["q1b"],
+                callback_data=_story_callback(story_set, story_idx, 1, "b"),
+            ),
         ],
         [
-            InlineKeyboardButton(story["q2a"], callback_data="sq_2_a"),
-            InlineKeyboardButton(story["q2b"], callback_data="sq_2_b"),
+            InlineKeyboardButton(
+                story["q2a"],
+                callback_data=_story_callback(story_set, story_idx, 2, "a"),
+            ),
+            InlineKeyboardButton(
+                story["q2b"],
+                callback_data=_story_callback(story_set, story_idx, 2, "b"),
+            ),
         ],
     ])
     for uid in get_user_ids():
@@ -1533,6 +1554,8 @@ async def send_story_one(context: ContextTypes.DEFAULT_TYPE):
         context,
         "🎭 القصة الأولى — طرائف السلف الصالح",
         story,
+        story_set="s",
+        story_idx=idx,
     )
 
 
@@ -1543,24 +1566,55 @@ async def send_story_two(context: ContextTypes.DEFAULT_TYPE):
         context,
         "🌙 القصة الثانية — المرابطون الصابرون من زمننا",
         story,
+        story_set="m",
+        story_idx=idx,
     )
 
 
 async def story_answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يستقبل إجابات أسئلة القصص ويردّ على المشترك."""
+    """يستقبل إجابات أسئلة القصص — يتحقق من الصواب ويرد بتغذية راجعة."""
     query = update.callback_query
     await query.answer()
-    data = query.data
-    if data.startswith("sq_1_"):
-        await query.message.reply_text(
-            "جزاك الله خيراً على إجابتك للسؤال الأول 🌿\n"
-            "تأمّل الإجابة وابحث في قلبك — العبرة الحقيقية ما خالطت الروح ☝🏻"
-        )
-    elif data.startswith("sq_2_"):
-        await query.message.reply_text(
-            "جزاك الله خيراً على إجابتك للسؤال الثاني 🤍\n"
+
+    # sq_{s|m}_{idx}_{q}_{a|b}
+    parts = query.data.split("_")          # ["sq", set, idx, q, choice]
+    if len(parts) != 5:
+        return
+
+    _, story_set, idx_str, q_str, choice = parts
+    try:
+        idx = int(idx_str)
+        q   = int(q_str)
+    except ValueError:
+        return
+
+    stories  = SALAF_STORIES if story_set == "s" else MURABITEEN_STORIES
+    idx      = idx % len(stories)
+    story    = stories[idx]
+    ans_key  = f"ans{q}"
+    correct  = story.get(ans_key, "")        # "أ" أو "ب"
+    chosen   = "أ" if choice == "a" else "ب"
+    is_right = chosen == correct
+
+    q_text   = story[f"q{q}"]
+    right_opt_key = f"q{q}{'a' if correct == 'أ' else 'b'}"
+    right_text    = story.get(right_opt_key, "")
+
+    if is_right:
+        reply = (
+            f"✅ أحسنتَ! الإجابة الصحيحة هي: {right_text}\n\n"
+            f"💡 {story['moral']}\n\n"
             "نسأل الله أن يجعلنا من أهل التدبر والعمل ☝🏻"
         )
+    else:
+        reply = (
+            f"❌ الإجابة الصحيحة كانت: {right_text}\n\n"
+            f"🤔 السؤال: {q_text}\n\n"
+            f"💡 {story['moral']}\n\n"
+            "لا بأس — التأمل في العبرة هو المقصود ☝🏻"
+        )
+
+    await query.message.reply_text(reply)
 
 
 ALGERIA_STORIES = [
